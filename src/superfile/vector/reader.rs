@@ -10,7 +10,7 @@
 
 use crate::superfile::format::checksum::crc32c;
 use crate::superfile::format::{self};
-use crate::superfile::vector::distance::{Metric, distance, distance_bytes};
+use crate::superfile::vector::distance::{Metric, distance_bytes};
 use crate::superfile::vector::quant::BitQuantizer;
 use crate::superfile::vector::rotation::RandomRotation;
 use crate::superfile::{ReadError, error::VectorError};
@@ -59,6 +59,11 @@ pub struct ColumnReader {
     /// docs per column.
     doc_to_pos: Vec<u32>,
     quant: BitQuantizer,
+    /// Cached random rotation built once at open from `(dim, rot_seed)`.
+    /// Construction is `O(dim³)` for Gram-Schmidt — at dim=384 that's
+    /// ~7.9 ms, dominant over every other per-query stage if rebuilt
+    /// per `search()`. Build once, reuse forever.
+    rot: RandomRotation,
 }
 
 /// Per-open knobs for [`VectorReader::open_with`]. `Default` is the
@@ -402,6 +407,7 @@ impl VectorReader {
                 doc_ids_off,
                 doc_to_pos,
                 quant,
+                rot: RandomRotation::new(dim, rot_seed),
             });
             column_id_by_name.insert(cfg.name.clone(), i as u32);
         }
@@ -468,21 +474,33 @@ impl VectorReader {
         let sub = &self.blob[col.subsection_range.clone()];
 
         // 1. Score query vs every centroid (cheap; n_cent is small).
+        //
+        // Zero-copy `f32x8` over the centroid bytes in `sub` via
+        // `distance_bytes` — `bytemuck::try_cast_slice` borrows the
+        // 4-aligned region (common case for our layout), falling
+        // back to a per-chunk LE decode if alignment is off. At
+        // `n_cent = 1024, dim = 384` this is 1024 zero-copy SIMD
+        // dot/L2² calls per query; no per-centroid heap allocation.
         let dim = col.dim;
+        let dim_bytes = dim * 4;
         let mut centroid_scores: Vec<(usize, f32)> = (0..col.n_cent as usize)
             .map(|c| {
-                let cv = read_f32_slice(sub, col.centroids_off + c * dim * 4, dim);
-                (c, distance(col.metric, query, &cv))
+                let start = col.centroids_off + c * dim_bytes;
+                let bytes = &sub[start..start + dim_bytes];
+                (c, distance_bytes(col.metric, query, bytes))
             })
             .collect();
         centroid_scores.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         let nprobe_eff = nprobe.min(col.n_cent as usize).max(1);
         centroid_scores.truncate(nprobe_eff);
 
-        // 2. Rotate query for the 1-bit code estimator.
-        let rot = RandomRotation::new(dim, col.rot_seed);
+        // 2. Rotate query for the 1-bit code estimator. The rotation
+        // matrix was built once at open and is cached on `col` —
+        // rebuilding it per `search()` costs `O(dim³)` Gram-Schmidt
+        // (~7.9 ms at dim=384), which dominates every other per-query
+        // stage. The `apply` itself is a cheap `O(dim²)` matvec.
         let mut q_rot = vec![0f32; dim];
-        rot.apply(query, &mut q_rot);
+        col.rot.apply(query, &mut q_rot);
 
         // 3. Scan codes within probed clusters → shortlist.
         let cb = col.quant.code_bytes();
@@ -536,11 +554,9 @@ impl VectorReader {
         // Score each candidate's full vector directly from its byte
         // slice in the blob — `distance_bytes` zero-copies into
         // `f32x8` when 4-aligned (the common case for our layout)
-        // and falls back to a per-chunk LE decode otherwise. This
-        // saves a `Vec<f32>` alloc + a 384-scalar byte-decode per
-        // candidate vs the older `read_f32_slice` path; at `k=10`
-        // and `rerank_mult=1024` that's 10K mallocs + ~4M scalar
-        // byte-loads per query removed.
+        // and falls back to a per-chunk LE decode otherwise. Same
+        // zero-copy pattern as the centroid probe above; no
+        // per-candidate heap allocation.
         let sub = &self.blob[col.subsection_range.clone()];
         let dim_bytes = col.dim * 4;
         let mut reranked: Vec<(u32, f32)> = shortlist
@@ -557,22 +573,6 @@ impl VectorReader {
         reranked.truncate(k);
         Ok(reranked)
     }
-}
-
-/// Read a `dim`-length f32 slice from `sub[start..]`. Returns owned
-/// Vec to avoid alignment issues with the underlying byte buffer.
-fn read_f32_slice(sub: &[u8], start: usize, dim: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(dim);
-    for i in 0..dim {
-        let s = start + i * 4;
-        out.push(f32::from_le_bytes([
-            sub[s],
-            sub[s + 1],
-            sub[s + 2],
-            sub[s + 3],
-        ]));
-    }
-    out
 }
 
 #[inline]

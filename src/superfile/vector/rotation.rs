@@ -22,6 +22,7 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 
 /// Row-major `dim × dim` orthonormal matrix.
+#[derive(Debug)]
 pub struct RandomRotation {
     pub dim: usize,
     /// Row-major: row `i` lives at `rows[i*dim .. (i+1)*dim]`.
