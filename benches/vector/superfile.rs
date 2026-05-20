@@ -119,9 +119,8 @@ fn build_infino_blob(vectors: &[f32]) -> Vec<u8> {
 
 fn open_infino_reader(blob: Vec<u8>) -> VectorReader {
     let n_cent = bench_corpus::n_cent(N_DOCS);
-    let json = format!(
-        r#"[{{"name":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#
-    );
+    let json =
+        format!(r#"[{{"name":"v","dim":{DIM},"n_cent":{n_cent},"rot_seed":7,"metric":"cosine"}}]"#);
     VectorReader::open(Bytes::from(blob), &json).expect("open VectorReader")
 }
 
@@ -170,9 +169,8 @@ fn calibrations() -> &'static Calibrations {
         );
         let mut inf: [Option<Calibrated>; 3] = [None; 3];
         for (i, &target) in RECALL_TARGETS.iter().enumerate() {
-            inf[i] = bench_corpus::calibrate_infino(
-                &reader, qs, gt, target, PROBES, REFINES, 21, TOP_K,
-            );
+            inf[i] =
+                bench_corpus::calibrate_infino(&reader, qs, gt, target, PROBES, REFINES, 21, TOP_K);
             eprintln!("  recall ≥ {target:.2} | infino: {:?}", inf[i]);
         }
         Calibrations { infino: inf }
@@ -228,8 +226,7 @@ fn bench(c: &mut Criterion) {
                     |b, &(p, r)| {
                         let q = &qs[0];
                         b.iter(|| {
-                            let hits =
-                                reader.search("v", black_box(q), TOP_K, p, r).expect("kNN");
+                            let hits = reader.search("v", black_box(q), TOP_K, p, r).expect("kNN");
                             black_box(hits)
                         });
                     },
@@ -330,8 +327,8 @@ fn emit_search_markdown() {
 
     let mut body = String::new();
     body.push_str(&format!(
-        "### Superfile vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
-    ));
+    "### Superfile vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
+  ));
     body.push_str("| Recall target | infino (probe, refine) | infino p50 |\n");
     body.push_str("|---------------|------------------------|------------|\n");
 
@@ -339,10 +336,7 @@ fn emit_search_markdown() {
         let label = format!("recall_at_least_{:02}", (target * 100.0) as u32);
         let row_target = format!("{target:.2}");
         if let Some(c_inf) = cal.infino[i] {
-            let id = format!(
-                "infino_{label}/p={},r={}",
-                c_inf.probe, c_inf.refine,
-            );
+            let id = format!("infino_{label}/p={},r={}", c_inf.probe, c_inf.refine,);
             let ns = read_mean_ns(group, &id);
             let p50 = ns.map(fmt_time).unwrap_or_else(|| "—".into());
             body.push_str(&format!(
@@ -356,8 +350,8 @@ fn emit_search_markdown() {
 
     body.push('\n');
     body.push_str(
-        "**infino default options** (`nprobe=8, rerank_mult=20` — user-facing latency baseline):\n\n",
-    );
+    "**infino default options** (`nprobe=8, rerank_mult=20` — user-facing latency baseline):\n\n",
+  );
     body.push_str("| Metric | Value |\n");
     body.push_str("|--------|-------|\n");
     let def = read_mean_ns(group, "infino_default_options_top10");

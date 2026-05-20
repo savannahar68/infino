@@ -120,8 +120,7 @@ fn build_supertable_infino(docs: &[String], reader_pool: Arc<ThreadPool>) -> Sup
     let chunk_size = docs.len().div_ceil(SEGMENTS);
     for chunk in docs.chunks(chunk_size) {
         let titles = LargeStringArray::from(chunk.iter().map(String::as_str).collect::<Vec<_>>());
-        let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)])
-            .expect("batch");
+        let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles)]).expect("batch");
         w.append(&batch).expect("append");
     }
     w.commit().expect("commit");
@@ -170,9 +169,7 @@ fn assert_infino_self_consistent(st: &Supertable) {
 // ─── Bench: ingest (group: supertable_fts_build) ──────────────────────
 
 fn bench_ingest(c: &mut Criterion) {
-    eprintln!(
-        "[supertable_fts_build] correctness: building infino ({N_DOCS} docs)..."
-    );
+    eprintln!("[supertable_fts_build] correctness: building infino ({N_DOCS} docs)...");
     let infino = build_supertable_infino(docs(), parallel_pool());
     assert_infino_self_consistent(&infino);
     eprintln!("[supertable_fts_build] correctness OK: infino self-consistent");

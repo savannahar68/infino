@@ -138,7 +138,11 @@ fn assert_bmw_matches_brute_force(reader: &FtsReader) -> usize {
         (
             "five_term",
             &[
-                "term00050", "term00051", "term00052", "term00053", "term00054",
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
             ],
         ),
     ];
@@ -188,8 +192,12 @@ fn assert_bmw_matches_brute_force(reader: &FtsReader) -> usize {
 
 // ─── Bench helpers ────────────────────────────────────────────────────
 
-fn bench_infino(c: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>,
-                name: &str, r: &FtsReader, terms: &'static [&'static str]) {
+fn bench_infino(
+    c: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>,
+    name: &str,
+    r: &FtsReader,
+    terms: &'static [&'static str],
+) {
     c.bench_function(format!("{name}_infino_top10"), |b| {
         b.iter(|| {
             let hits = r
@@ -205,8 +213,12 @@ fn bench_infino(c: &mut criterion::BenchmarkGroup<criterion::measurement::WallTi
     });
 }
 
-fn bench_per_algo_probe(c: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>,
-                        name: &str, r: &FtsReader, terms: &'static [&'static str]) {
+fn bench_per_algo_probe(
+    c: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>,
+    name: &str,
+    r: &FtsReader,
+    terms: &'static [&'static str],
+) {
     c.bench_function(format!("{name}_wand_top10"), |b| {
         b.iter(|| {
             let hits = r
@@ -274,14 +286,28 @@ fn bench(c: &mut Criterion) {
         bench_infino(&mut g, "single_df1", &r, &["doc0500000"]);
         bench_infino(&mut g, "single_common", &r, &["term00001"]);
         bench_infino(&mut g, "two_term_or", &r, &["term00001", "term00050"]);
-        bench_infino(&mut g, "three_wide", &r, &["term00001", "term00050", "term00100"]);
-        bench_infino(&mut g, "three_similar", &r, &["term00050", "term00051", "term00052"]);
+        bench_infino(
+            &mut g,
+            "three_wide",
+            &r,
+            &["term00001", "term00050", "term00100"],
+        );
+        bench_infino(
+            &mut g,
+            "three_similar",
+            &r,
+            &["term00050", "term00051", "term00052"],
+        );
         bench_infino(
             &mut g,
             "five_term",
             &r,
             &[
-                "term00050", "term00051", "term00052", "term00053", "term00054",
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
             ],
         );
 
@@ -303,7 +329,11 @@ fn bench(c: &mut Criterion) {
             "similar_5",
             &r,
             &[
-                "term00050", "term00051", "term00052", "term00053", "term00054",
+                "term00050",
+                "term00051",
+                "term00052",
+                "term00053",
+                "term00054",
             ],
         );
 

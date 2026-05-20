@@ -168,8 +168,7 @@ fn build_supertable() -> Supertable {
             None,
         )
         .expect("FSL");
-        let batch =
-            RecordBatch::try_new(supertable_schema(), vec![Arc::new(fsl)]).expect("batch");
+        let batch = RecordBatch::try_new(supertable_schema(), vec![Arc::new(fsl)]).expect("batch");
         w.append(&batch).expect("append");
         w.commit().expect("commit");
     }
@@ -430,8 +429,8 @@ fn emit_search_markdown() {
 
     let mut body = String::new();
     body.push_str(&format!(
-        "### Supertable vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
-    ));
+    "### Supertable vector — search ({N_DOCS} docs × dim={DIM}, calibrated at recall targets)\n\n"
+  ));
     body.push_str("| Recall target | supertable (probe/seg, refine) | supertable p50 |\n");
     body.push_str("|---------------|--------------------------------|----------------|\n");
 

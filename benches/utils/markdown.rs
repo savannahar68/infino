@@ -124,11 +124,7 @@ pub fn read_mean_ns(group: &str, bench: &str) -> Option<f64> {
 /// Mean time + throughput per second given a per-iteration element
 /// count. `None` if the bench result isn't on disk.
 #[allow(dead_code)]
-pub fn read_mean_with_throughput(
-    group: &str,
-    bench: &str,
-    elements: u64,
-) -> Option<(f64, f64)> {
+pub fn read_mean_with_throughput(group: &str, bench: &str, elements: u64) -> Option<(f64, f64)> {
     let ns = read_mean_ns(group, bench)?;
     if ns <= 0.0 {
         return None;
