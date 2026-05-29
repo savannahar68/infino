@@ -20,6 +20,7 @@ use crate::superfile::vector::rotation::RandomRotation;
 use crate::superfile::vector::spill::{
     ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
 };
+use crate::superfile::vector::sq8_simd::{Sq8EncodeConsts, sq8_encode_row, update_min_max};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -716,6 +717,22 @@ fn build_subsection_streaming(
     //     the kernel page cache handling streaming reads.
     let chunk_rows = chunk_rows_for_dim(dim);
     let mut summary_radius_sq_max: f32 = 0.0;
+    // Per-cluster (min, max) accumulators for the Sq8 quantizer.
+    // Pass 2 folds each row's per-dim extrema into the destination
+    // cluster's slice as it routes the row to a bucket — the result
+    // is the per-cluster (scale, offset) that pass 3 used to derive
+    // by re-scanning the cluster's fp32 rows. Allocated only for
+    // Sq8 columns (~`2 * n_cent * dim * 4` bytes; e.g. 3 MiB at
+    // `n_cent = 1024, dim = 384`).
+    let codec = cfg.rerank_codec;
+    let (mut sq8_min_arr, mut sq8_max_arr): (Vec<f32>, Vec<f32>) = if codec == RerankCodec::Sq8 {
+        (
+            vec![f32::INFINITY; n_cent * dim],
+            vec![f32::NEG_INFINITY; n_cent * dim],
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     if n_docs > 0 {
         let mut source: Box<dyn ChunkedVectorSource> = if let Some(spill) = spill {
             // Crossed the threshold during add(): close the
@@ -740,6 +757,11 @@ fn build_subsection_streaming(
             ))
         };
 
+        let sq8_acc: Option<(&mut [f32], &mut [f32])> = if codec == RerankCodec::Sq8 {
+            Some((&mut sq8_min_arr, &mut sq8_max_arr))
+        } else {
+            None
+        };
         run_pass2(
             source.as_mut(),
             dim,
@@ -752,9 +774,31 @@ fn build_subsection_streaming(
             &mut bucket_writers,
             &mut bucket_counts,
             &mut summary_radius_sq_max,
-            cfg.rerank_codec,
+            codec,
+            sq8_acc,
         )?;
     }
+
+    // Pre-derive every cluster's `(scale, offset)` from the
+    // (min, max) accumulators populated by pass 2. Pass 3 then
+    // becomes a single streaming encode per row instead of the old
+    // "buffer the whole cluster, scan for min/max, encode" sequence
+    // that needed `sq8_scratch` of `max_cluster_rows * dim * f32`.
+    let sq8_quantizers: Vec<(Vec<f32>, Vec<f32>)> = if codec == RerankCodec::Sq8 {
+        (0..n_cent)
+            .map(|c| {
+                let off = c * dim;
+                derive_sq8_quantizer_from_min_max(
+                    &sq8_min_arr[off..off + dim],
+                    &sq8_max_arr[off..off + dim],
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    drop(sq8_min_arr);
+    drop(sq8_max_arr);
 
     // Flush + close every bucket writer before pass 3 reads the
     // files. The Drop of `bucket_writers` would do this, but
@@ -780,7 +824,6 @@ fn build_subsection_streaming(
     // directly into their final on-disk slots — eliminates the
     // O(n_docs · dim · 4) `full_layout` round-trip the old pipeline
     // did between bucket-read and codec-encode.
-    let codec = cfg.rerank_codec;
     let summary_size = dim * 4;
     let centroids_size = n_cent * dim * 4;
     let cluster_idx_size = n_cent * 8;
@@ -796,7 +839,7 @@ fn build_subsection_streaming(
     let codes_off = cluster_idx_off + cluster_idx_size;
     // `codec_meta_off` is the on-disk slot in the sub-header for the
     // codec metadata region's start. Zero means "no codec metadata
-    // in this subsection" — Fp32 / Bf16 / RabitqOnly write 0 here
+    // in this subsection" — Fp32 / RabitqOnly write 0 here
     // and stay byte-identical to legacy fp32 segments that left the
     // (formerly reserved) slot zero.
     let codec_meta_off_value: u32 = if codec_meta_size == 0 {
@@ -871,25 +914,6 @@ fn build_subsection_streaming(
         debug_assert_eq!(acc_off as usize, n_docs);
     }
 
-    // ---- Per-cluster streaming pass ----
-    //
-    // Replaces the old two-step "stage every row in
-    // full_layout/codes_layout/doc_ids_layout, then assemble into
-    // bytes" pipeline. For each cluster `c` we read its bucket file
-    // exactly once and write each row's fields directly into the
-    // correct on-disk slots:
-    //
-    //   doc_id    → bytes[doc_ids_off + pos * 4 ..]
-    //   rabitq    → bytes[codes_off   + pos * code_bytes ..]
-    //   full[]    → codec-dependent slot in bytes (see match below)
-    //
-    // The only resident scratch is the cluster's `full_block`
-    // (`cluster_count * dim * 4` bytes when the codec writes a
-    // full[] payload), reused across clusters. Sq8 needs the whole
-    // cluster's fp32 rows in hand before it can derive `(scale,
-    // offset)`, which is exactly what `full_block` already contains
-    // after the bulk read.
-    //
     // Sq8 codec_meta region layout (when present):
     //   [scale_block | offset_block | per_doc_norms?]
     //   scale_block  = n_cent * dim * 4 bytes
@@ -904,19 +928,47 @@ fn build_subsection_streaming(
             None
         };
 
+    // ---- Per-cluster streaming pass ----
+    //
+    // Replaces the old two-step "stage every row in
+    // full_layout/codes_layout/doc_ids_layout, then assemble into
+    // bytes" pipeline. For each cluster `c` we read its bucket file
+    // exactly once and write each row's fields directly into the
+    // correct on-disk slots:
+    //
+    //   doc_id    → bytes[doc_ids_off + pos * 4 ..]
+    //   rabitq    → bytes[codes_off   + pos * code_bytes ..]
+    //   full[]    → codec-dependent slot in bytes (see match below)
+    //
     // Per-cluster bucket payload is row-major
     //   [doc_id u32 | code(code_bytes) | full_row?]
     // and pass 2 wrote each row in one shot. In final assembly we
     // mirror that on the read side: read all doc_ids, all codes, and
     // (when present) all full-row payload as three contiguous block
     // reads — one `read_exact` per block instead of three per row.
+    // Sq8 reuses the `full_block` directly (cluster's fp32 rows are
+    // already there post-bulk-read) and encodes against the
+    // `(inv_scale, c2)` FMA constants derived inline from this
+    // cluster's `(scale, offset)` quantizer.
     let full_row_bytes_in_bucket = if codec.writes_full() { dim * 4 } else { 0 };
     let mut id_block: Vec<u8> = Vec::new();
     let mut code_block: Vec<u8> = Vec::new();
     let mut full_block: Vec<u8> = Vec::new();
-    let mut row_fp32_scratch: Vec<f32> = Vec::new();
 
     for (c, &(cluster_off_u32, cluster_count_u32)) in cluster_index.iter().enumerate() {
+        // Sq8 codec_meta: write this cluster's (scale, offset) byte
+        // pair into the codec_meta region. Done *before* the empty-
+        // cluster skip so empty clusters still carry their sentinel
+        // quantizer bytes — keeps the on-disk byte pattern stable
+        // regardless of pass-2 assignment outcomes.
+        if codec == RerankCodec::Sq8 {
+            let (scale_c, offset_c) = &sq8_quantizers[c];
+            let sc_off = sq8_scale_block_off + c * dim * 4;
+            bytes[sc_off..sc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(scale_c));
+            let oc_off = sq8_offset_block_off + c * dim * 4;
+            bytes[oc_off..oc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(offset_c));
+        }
+
         if cluster_count_u32 == 0 {
             continue;
         }
@@ -956,50 +1008,36 @@ fn build_subsection_streaming(
 
         // full[] region — codec-dependent. RabitqOnly has no full[]
         // payload on disk and pass 2 didn't spill one. Fp32 is a
-        // direct block copy. Bf16/Sq8 transcode out of the fp32
-        // block buffer.
+        // direct block copy. Sq8 transcodes out of the fp32 block
+        // buffer.
         match codec {
             RerankCodec::RabitqOnly => {}
             RerankCodec::Fp32 => {
                 let dst_base = full_off + cluster_off * dim * 4;
                 bytes[dst_base..dst_base + cluster_count * dim * 4].copy_from_slice(&full_block);
             }
-            RerankCodec::Bf16 => {
-                // bf16 destination is 2 bytes/lane; read the fp32
-                // block as &[f32] (Vec<u8> is f32-aligned only when
-                // we go through bytemuck on a fresh aligned slab —
-                // here we re-stage one row at a time to keep lane-
-                // wise rounding identical to the previous code path).
-                if row_fp32_scratch.len() < dim {
-                    row_fp32_scratch.resize(dim, 0.0);
-                }
-                for i in 0..cluster_count {
-                    let pos = cluster_off + i;
-                    let src = &full_block[i * dim * 4..(i + 1) * dim * 4];
-                    let row = &mut row_fp32_scratch[..dim];
-                    bytemuck::cast_slice_mut::<f32, u8>(row).copy_from_slice(src);
-                    let off = full_off + pos * dim * 2;
-                    for (d, &x) in row.iter().enumerate() {
-                        let bf = crate::superfile::vector::distance::fp32_to_bf16(x);
-                        bytes[off + d * 2..off + d * 2 + 2].copy_from_slice(&bf.to_le_bytes());
-                    }
-                }
-            }
             RerankCodec::Sq8 => {
                 // The cluster's fp32 rows are already in `full_block`
-                // (one bulk read above). Hand the slice to the
-                // per-cluster encode helper below.
+                // (one bulk read above). Derive this cluster's
+                // `(inv_scale, c2)` FMA constants from its
+                // `(scale, offset)` quantizer and encode in place via
+                // the SIMD encoder; also fill the per-doc norms slot
+                // when the column needs decoded `Σ x²` at search
+                // time (L2Sq / Cosine).
                 let cluster_rows: &[f32] = bytemuck::cast_slice(&full_block);
-                encode_sq8_cluster(
+                let (scale_c, offset_c) = &sq8_quantizers[c];
+                let ec = Sq8EncodeConsts::from_scale_offset(scale_c, offset_c);
+                encode_sq8_cluster_simd(
                     cluster_rows,
                     dim,
                     cluster_count,
                     cluster_off,
-                    c,
                     full_off,
-                    sq8_scale_block_off,
-                    sq8_offset_block_off,
                     sq8_norms_block_off,
+                    &ec.inv_scale,
+                    &ec.c2,
+                    scale_c,
+                    offset_c,
                     &mut bytes,
                 );
             }
@@ -1016,151 +1054,96 @@ fn build_subsection_streaming(
     })
 }
 
-/// Sq8 per-cluster encode for the final-assembly pass.
+/// Sq8 per-cluster SIMD encode for the final-assembly pass.
 ///
 /// Given the cluster's fp32 rows (already loaded into the
-/// caller's `full_block` scratch and reinterpreted as `&[f32]`),
-/// derive `(scale_c, offset_c)`, write them into the codec_meta
-/// scale/offset blocks for cluster `c`, and emit u8 codes into
-/// the on-disk full[] region. When the column carries decoded
-/// per-doc `Σ x²` (L2Sq/Cosine), also fill the per-doc norms
-/// block — the search-side kernel reads it directly to skip
-/// recomputing the decoded norm at rerank time.
+/// caller's `full_block` scratch and reinterpreted as `&[f32]`)
+/// and the pre-derived `(inv_scale, c2)` FMA constants for this
+/// cluster (built once before pass 3 from pass 2's per-cluster
+/// (min, max) accumulators), emit u8 codes into the on-disk
+/// full[] region via `sq8_encode_row` — a single FMA + clamp +
+/// truncating-cast per lane, dispatched through AVX-512 / AVX2 /
+/// `wide::f32x8` tiers.
+///
+/// When the column carries decoded per-doc `Σ x²` (L2Sq /
+/// Cosine), also fill the per-doc norms block. Norms accumulation
+/// stays scalar with an f64 accumulator so the on-disk byte
+/// pattern of the norms block is independent of which SIMD tier
+/// the encoder dispatched into.
+///
+/// Codec_meta (scale, offset) blocks are written separately, once,
+/// before pass 3 starts — they're pure functions of pass 2's
+/// (min, max) and don't need to be re-emitted per cluster here.
 #[allow(clippy::too_many_arguments)]
-fn encode_sq8_cluster(
+fn encode_sq8_cluster_simd(
     cluster_rows: &[f32],
     dim: usize,
     cluster_count: usize,
     cluster_off: usize,
-    c: usize,
     full_off: usize,
-    sq8_scale_block_off: usize,
-    sq8_offset_block_off: usize,
     sq8_norms_block_off: Option<usize>,
+    inv_scale_c: &[f32],
+    c2_c: &[f32],
+    scale_c: &[f32],
+    offset_c: &[f32],
     bytes: &mut [u8],
 ) {
     debug_assert_eq!(cluster_rows.len(), cluster_count * dim);
-
-    let (scale_c, offset_c) = compute_sq8_quantizer_for_cluster(cluster_rows, dim, cluster_count);
-
-    let sc_off = sq8_scale_block_off + c * dim * 4;
-    bytes[sc_off..sc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(&scale_c));
-    let oc_off = sq8_offset_block_off + c * dim * 4;
-    bytes[oc_off..oc_off + dim * 4].copy_from_slice(bytemuck::cast_slice(&offset_c));
 
     for i in 0..cluster_count {
         let src = &cluster_rows[i * dim..(i + 1) * dim];
         let pos = cluster_off + i;
         let code_off = full_off + pos * dim;
-        let mut acc = 0.0f64;
-        for d in 0..dim {
-            let q = ((src[d] - offset_c[d]) / scale_c[d]).round();
-            // Clamp on the boundary handles fp rounding artefacts at
-            // the min/max ends; the cast is then in-range by
-            // construction.
-            let qc = q.clamp(0.0, 255.0) as u8;
-            bytes[code_off + d] = qc;
-            if sq8_norms_block_off.is_some() {
+        sq8_encode_row(src, inv_scale_c, c2_c, &mut bytes[code_off..code_off + dim]);
+        if let Some(norms_off) = sq8_norms_block_off {
+            let mut acc = 0.0f64;
+            for d in 0..dim {
+                let qc = bytes[code_off + d];
                 let x = (qc as f32) * scale_c[d] + offset_c[d];
                 acc += (x as f64) * (x as f64);
             }
-        }
-        if let Some(norms_off) = sq8_norms_block_off {
             let n_off = norms_off + pos * 4;
             bytes[n_off..n_off + 4].copy_from_slice(&(acc as f32).to_le_bytes());
         }
     }
 }
 
-/// Scan one cluster's rows for per-dim min/max and derive the
-/// Sq8 quantizer `(scale[dim], offset[dim])` for that cluster.
+/// Sq8 per-cluster (min, max) → (scale, offset) derivation.
 ///
-/// Quantization scheme: `q = clamp(round((x − offset[d]) /
-/// scale[d]), 0, 255)`. With `offset[d] = min_x[d]` and
-/// `scale[d] = (max_x[d] − min_x[d]) / 255`, this maps the
-/// cluster's observed range onto the full u8 grid. When a dim
-/// is constant within the cluster (`max == min`) we set
-/// `scale = 1.0` and `offset = min` — every code in that dim
-/// lands at 0 and the decoder recovers the constant exactly.
+/// `min` and `max` are the per-dim extrema observed across this
+/// cluster's rows; produced by `update_min_max` during pass 2.
+/// Quantization scheme:
+///     `q[d] = clamp(round((x[d] − offset[d]) / scale[d]), 0, 255)`
+/// with `offset[d] = min[d]` and `scale[d] = (max[d] − min[d]) / 255`.
+/// When a dim is constant across the cluster (`max == min`) we set
+/// `scale = 1.0` and `offset = min` — every code lands at 0 and the
+/// decoder recovers the constant exactly.
 ///
-/// Per-cluster (not per-column) quantizers preserve recall on
-/// highly-clustered cosine corpora; see
-/// `RerankCodec::codec_meta_bytes` for the per-column failure mode.
-///
-/// Parallel reduce over `cluster_rows.chunks(dim)` for n_rows
-/// ≥ 64; sequential fallback for smaller clusters where
-/// rayon's fork-join overhead would dominate.
-fn compute_sq8_quantizer_for_cluster(
-    cluster_rows: &[f32],
-    dim: usize,
-    n_rows: usize,
-) -> (Vec<f32>, Vec<f32>) {
-    debug_assert_eq!(cluster_rows.len(), n_rows * dim);
-
-    let (min_vec, max_vec) = if n_rows == 0 {
-        // Empty cluster — emit an identity quantizer. No doc
-        // ever encodes through this slot, but the reader still
-        // reads `dim` floats of each from disk so we must write
-        // something well-defined. scale=1, offset=0 makes the
-        // decoder a no-op on the all-zero codes (which the
-        // builder also never emits) and keeps the codec_meta
-        // arrays free of NaN sentinels that would break the
-        // float bit-pattern equality used in some tests.
-        (vec![0.0f32; dim], vec![0.0f32; dim])
-    } else if n_rows < 64 {
-        let mut min_vec = cluster_rows[..dim].to_vec();
-        let mut max_vec = cluster_rows[..dim].to_vec();
-        for row in 1..n_rows {
-            for d in 0..dim {
-                let x = cluster_rows[row * dim + d];
-                if x < min_vec[d] {
-                    min_vec[d] = x;
-                }
-                if x > max_vec[d] {
-                    max_vec[d] = x;
-                }
-            }
-        }
-        (min_vec, max_vec)
-    } else {
-        cluster_rows
-            .par_chunks(dim)
-            .fold(
-                || (vec![f32::INFINITY; dim], vec![f32::NEG_INFINITY; dim]),
-                |(mut mn, mut mx), row| {
-                    for (d, &x) in row.iter().enumerate() {
-                        if x < mn[d] {
-                            mn[d] = x;
-                        }
-                        if x > mx[d] {
-                            mx[d] = x;
-                        }
-                    }
-                    (mn, mx)
-                },
-            )
-            .reduce(
-                || (vec![f32::INFINITY; dim], vec![f32::NEG_INFINITY; dim]),
-                |(mut a_min, mut a_max), (b_min, b_max)| {
-                    for d in 0..dim {
-                        if b_min[d] < a_min[d] {
-                            a_min[d] = b_min[d];
-                        }
-                        if b_max[d] > a_max[d] {
-                            a_max[d] = b_max[d];
-                        }
-                    }
-                    (a_min, a_max)
-                },
-            )
-    };
-
+/// Empty clusters (no rows assigned) carry `min = +inf, max = -inf`
+/// from the initial fill; the caller passes those through here and
+/// gets `scale = 1.0, offset = +inf` which is well-defined (no
+/// row ever encodes through the slot) and avoids NaN bit patterns
+/// that would break codec_meta byte-pattern equality.
+#[inline]
+fn derive_sq8_quantizer_from_min_max(min: &[f32], max: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    debug_assert_eq!(min.len(), max.len());
+    let dim = min.len();
     let mut scale = vec![0.0f32; dim];
     let mut offset = vec![0.0f32; dim];
     for d in 0..dim {
-        offset[d] = min_vec[d];
-        let span = max_vec[d] - min_vec[d];
-        scale[d] = if span > 0.0 { span / 255.0 } else { 1.0 };
+        // Initial-fill sentinels stay well-defined: an empty
+        // cluster has `min[d] = +inf, max[d] = -inf` → `span < 0`
+        // → we collapse to the identity-quantizer branch below
+        // (`scale = 1.0`, `offset` carries the sentinel which is
+        // never decoded because no doc was assigned).
+        let span = max[d] - min[d];
+        if span > 0.0 && span.is_finite() {
+            offset[d] = min[d];
+            scale[d] = span / 255.0;
+        } else {
+            offset[d] = if min[d].is_finite() { min[d] } else { 0.0 };
+            scale[d] = 1.0;
+        }
     }
     (scale, offset)
 }
@@ -1189,6 +1172,14 @@ fn run_pass2(
     bucket_counts: &mut [u32],
     summary_radius_sq_max: &mut f32,
     codec: RerankCodec,
+    // Optional per-cluster (min, max) accumulators for the Sq8
+    // quantizer. When `Some`, pass 2 folds each routed row's per-dim
+    // extrema into the destination cluster's `min[dim]` / `max[dim]`
+    // slices via the SIMD `update_min_max` helper — eliminating the
+    // separate per-cluster min/max scan that pass 3 used to do after
+    // re-reading the bucket files. When `None` (any non-Sq8 codec),
+    // pass 2 skips the update entirely.
+    mut sq8_min_max: Option<(&mut [f32], &mut [f32])>,
 ) -> Result<(), BuildError> {
     let chunk_rows_cap = source.chunk_rows();
     // Pre-allocate per-chunk scratch reused across iterations to
@@ -1248,6 +1239,17 @@ fn run_pass2(
         // anyway. `RabitqOnly` columns skip the fp32 vector spill
         // because they have no `full[]` region on disk.
         let write_full = codec.writes_full();
+        // Split `sq8_min_max` once per chunk into Some/None so the
+        // hot loop doesn't pay a per-row `Option` match. Pull the
+        // two `&mut [f32]` out and stash them as raw pointers; the
+        // routing loop owns the only mutable references for the
+        // duration of the chunk, so the borrow checker would let us
+        // do this with split_at_mut + tracked slices but the pointer
+        // form keeps the per-row work to one indexed slice slice
+        // each, which is what we want for the SIMD inner-loop call.
+        // Per-chunk reborrow of the option-of-mutable-pair into the
+        // routing loop. Cheap.
+        let mut sq8_acc = sq8_min_max.as_mut();
         for r in 0..actual_rows {
             let cid = asgn[r] as usize;
             let local_doc_id = global_doc_id + r as u32;
@@ -1256,6 +1258,15 @@ fn run_pass2(
             writer.write_all(&chunk_codes[r * code_bytes..(r + 1) * code_bytes])?;
             if write_full {
                 writer.write_all(bytemuck::cast_slice(&chunk[r * dim..(r + 1) * dim]))?;
+            }
+            // Fold this row into the destination cluster's (min, max)
+            // accumulator when the column is Sq8. Per-cluster slice
+            // indexing is `cid * dim`; the SIMD update is up to 16
+            // f32 lanes per iteration.
+            if let Some((mn, mx)) = sq8_acc.as_deref_mut() {
+                let row = &chunk[r * dim..(r + 1) * dim];
+                let off = cid * dim;
+                update_min_max(row, &mut mn[off..off + dim], &mut mx[off..off + dim]);
             }
             bucket_counts[cid] += 1;
         }
