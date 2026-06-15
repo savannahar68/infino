@@ -36,7 +36,7 @@ pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/
 **Node.js**
 
 ```sh
-npm install infino
+npm install infino --registry https://npm-proxy.fury.io/infino/
 ```
 
 **Rust**
