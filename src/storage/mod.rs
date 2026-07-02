@@ -37,12 +37,14 @@ use bytes::Bytes;
 use thiserror::Error;
 
 pub mod azure;
+pub mod gcs;
 pub mod local_fs;
 pub(crate) mod options;
 mod retry;
 pub mod s3;
 
 pub use azure::AzureStorageProvider;
+pub use gcs::GcsStorageProvider;
 pub use local_fs::LocalFsStorageProvider;
 pub(crate) use options::StorageOptions;
 pub use s3::S3StorageProvider;
@@ -115,6 +117,19 @@ pub enum StorageError {
 /// so `Arc<dyn StorageProvider>` can be shared across the
 /// supertable: the manifest part loader, the disk cache
 /// store, and the writer all hold clones of the *same* `Arc`.
+///
+/// ## CAS-token invariant
+///
+/// A provider's conditional-write token is a single opaque,
+/// backend-defined value. The token surfaced in [`ObjectMeta::etag`]
+/// by `head`/`get`, the token returned by `put_atomic` /
+/// `put_if_match`, and the token accepted by `put_if_match`'s
+/// `expected_etag` are all the **same kind** (S3/Azure: the HTTP ETag;
+/// GCS: the object generation). Callers chain the *returned* token
+/// into the next `put_if_match` without re-reading, so a provider that
+/// returns a different token kind than it accepts silently breaks OCC.
+/// The `cas_conformance` test helper enforces this against every
+/// backend.
 #[async_trait]
 pub trait StorageProvider: Send + Sync + fmt::Debug {
     /// Cheap metadata lookup. Used by the cold-fetch
@@ -231,7 +246,7 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     ///
     /// Default returns an empty list — test/mock providers that don't
     /// need listing can leave the default in place; production providers
-    /// (LocalFs, S3, Azure) override.
+    /// (LocalFs, S3, Azure, GCS) override.
     async fn list_with_prefix_metadata(
         &self,
         _prefix: &str,
