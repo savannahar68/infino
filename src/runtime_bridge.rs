@@ -106,10 +106,10 @@ where
 /// `Supertable` so open handles add zero tokio workers. Never shut
 /// down — the static keeps a reference until process exit, so handle
 /// drops from inside a caller's async context have nothing to tear down.
-static SHARED_QUERY_RUNTIME: OnceLock<Arc<runtime::Runtime>> = OnceLock::new();
+static SHARED_IO_RUNTIME: OnceLock<Arc<runtime::Runtime>> = OnceLock::new();
 
-pub(crate) fn shared_query_runtime() -> Arc<runtime::Runtime> {
-    Arc::clone(SHARED_QUERY_RUNTIME.get_or_init(|| build_query_runtime("infino-io")))
+pub(crate) fn shared_io_runtime() -> Arc<runtime::Runtime> {
+    Arc::clone(SHARED_IO_RUNTIME.get_or_init(|| build_query_runtime("infino-io")))
 }
 
 /// Shared multi-thread runtime for driving the sync query API's async I/O.

@@ -45,7 +45,7 @@ use crate::{
     InfinoError,
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
     memory::ConnectionMemoryBudget,
-    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_query_runtime},
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     storage::{StorageError, StorageProvider},
     superfile::{
         builder::FtsConfig,
@@ -514,7 +514,7 @@ impl Connection {
 
     /// Runtime for the table-free `query_sql` fallback.
     fn query_runtime(&self) -> Arc<Runtime> {
-        shared_query_runtime()
+        shared_io_runtime()
     }
 }
 

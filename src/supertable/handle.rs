@@ -36,7 +36,7 @@ use super::{
     options::SupertableOptions,
 };
 use crate::{
-    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_query_runtime},
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     storage::StorageError,
     supertable::{
         ManifestLoadError, SuperfileUri, SupertableStats,
@@ -145,7 +145,7 @@ impl SupertableInner {
     /// isn't already on a tokio runtime. Process-wide — see
     /// [`shared_query_runtime`].
     pub(super) fn query_runtime(&self) -> Arc<Runtime> {
-        shared_query_runtime()
+        shared_io_runtime()
     }
 }
 
