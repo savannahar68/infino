@@ -397,6 +397,9 @@ pub enum QueryError {
     #[error("DataFusion failed to execute the query: {0}")]
     Execute(String),
 
+    #[error("query exceeded the connection memory budget: {0}")]
+    OverBudget(String),
+
     #[error("manifest load error: {0}")]
     ManifestLoad(ManifestLoadError),
 }

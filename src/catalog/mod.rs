@@ -30,7 +30,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
-use datafusion::{config::Dialect, execution::context::SessionContext};
+use datafusion::{config::Dialect, error::DataFusionError};
 use futures::future::try_join_all;
 pub use index_spec::IndexSpec;
 use manifest::{
@@ -44,7 +44,7 @@ use uri::{Backend, parse_uri};
 use crate::{
     InfinoError,
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
-    memory::ConnectionMemoryBudget,
+    memory::{ConnectionMemoryBudget, budgeted_session_context},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     storage::{StorageError, StorageProvider},
     superfile::{
@@ -454,7 +454,11 @@ impl Connection {
     /// ```
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(sql, "running sql query");
-        let ctx = SessionContext::new();
+
+        // Gate SQL heap on the connection budget: DataFusion allocates the
+        // working set (sort / aggregate / join), so its pool is the gate.
+        let ctx = budgeted_session_context(&self.inner.connection_memory_budget)
+            .map_err(|e| InfinoError::Query(e.to_string()))?;
 
         // Resolve the relations the query names and register each that is a
         // catalog table. Unknown names (CTEs, search TVFs, aliases) are
@@ -498,9 +502,7 @@ impl Connection {
                 .sql(&sql)
                 .await
                 .map_err(|e| InfinoError::Query(e.to_string()))?;
-            df.collect()
-                .await
-                .map_err(|e| InfinoError::Query(e.to_string()))
+            df.collect().await.map_err(sql_exec_error)
         };
         // A query that names a `FROM` catalog table drives on that table's
         // runtime; otherwise the connection's own. The fallback still has to
@@ -535,6 +537,15 @@ fn build_options(
     // Set last so no builder step can reset the shared connection budget.
     opts.connection_memory_budget = connection_memory_budget;
     Ok(opts)
+}
+
+/// Map a SQL execution error to the public error: a budget exhaustion becomes
+/// [`InfinoError::OverBudget`], anything else a generic query error.
+fn sql_exec_error(e: DataFusionError) -> InfinoError {
+    match e {
+        DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg),
+        other => InfinoError::Query(other.to_string()),
+    }
 }
 
 /// The v1 default tokenizer, required iff the spec has FTS columns.
@@ -1031,6 +1042,85 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 3, "2 from docs + 1 from more");
+    }
+
+    // Many distinct group keys force DataFusion's aggregate to build a real
+    // hash table, so its memory pool (the connection budget) is exercised.
+    fn many_distinct_titles() -> Vec<String> {
+        (0..4000)
+            .map(|i| format!("distinct title number {i} with some filler text"))
+            .collect()
+    }
+
+    fn append_titles(conn: &Connection) -> usize {
+        let docs = conn
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        let titles = many_distinct_titles();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        docs.append(&build_title_batch(&refs)).expect("append");
+        titles.len()
+    }
+
+    const HEAVY_GROUP_BY: &str = "SELECT title, COUNT(*) AS n FROM docs GROUP BY title";
+
+    #[test]
+    fn query_sql_under_measure_only_default_is_never_refused() {
+        // Default budget only measures, so even a heavy aggregate runs.
+        let conn = connect("memory://").expect("connect");
+        let n = append_titles(&conn);
+        let out = conn
+            .query_sql(HEAVY_GROUP_BY)
+            .expect("measure-only never refuses");
+        assert_eq!(n_rows(&out), n);
+    }
+
+    #[test]
+    fn query_sql_under_a_generous_budget_succeeds() {
+        // 1 GiB is far more than the query needs, so the gate never trips.
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1 << 30),
+        )
+        .expect("connect");
+        let n = append_titles(&conn);
+        let out = conn.query_sql(HEAVY_GROUP_BY).expect("well under 1 GiB");
+        assert_eq!(n_rows(&out), n);
+    }
+
+    #[test]
+    fn query_sql_over_a_tiny_budget_is_refused_as_over_budget() {
+        // 0-byte gate: the aggregate can't reserve its first byte, and spilling
+        // needs memory it doesn't have, so it's refused as OverBudget.
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1),
+        )
+        .expect("connect");
+        append_titles(&conn);
+        let err = conn
+            .query_sql(HEAVY_GROUP_BY)
+            .expect_err("a 0-byte gate refuses the aggregate");
+        assert!(
+            matches!(err, InfinoError::OverBudget(_)),
+            "expected OverBudget, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn query_sql_streaming_scan_is_not_refused_under_a_tiny_budget() {
+        // A projection streams (no buffering), so it reserves nothing and runs
+        // even at a 0-byte gate: the budget bounds sort/aggregate/join, not scans.
+        let conn = connect_with(
+            "memory://",
+            ConnectOptions::new().with_connection_memory_budget_bytes(1),
+        )
+        .expect("connect");
+        let n = append_titles(&conn);
+        let out = conn
+            .query_sql("SELECT title FROM docs")
+            .expect("a streaming scan is not gated");
+        assert_eq!(n_rows(&out), n);
     }
 
     #[test]

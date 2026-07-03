@@ -50,20 +50,32 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
-use datafusion::{execution::context::SessionContext, prelude::Expr};
+use datafusion::{error::DataFusionError, execution::context::SessionContext, prelude::Expr};
 
-use crate::supertable::{
-    error::QueryError,
-    handle::{Supertable, SupertableReader},
-    query::{
-        covered_agg::CoveredAggregateRewrite,
-        exec::{
-            fts_exec::register_bm25, hybrid_exec::register_hybrid_search,
-            match_exec::register_match, vector_exec::register_vector_search,
+use crate::{
+    memory::budgeted_session_context,
+    supertable::{
+        error::QueryError,
+        handle::{Supertable, SupertableReader},
+        query::{
+            covered_agg::CoveredAggregateRewrite,
+            exec::{
+                fts_exec::register_bm25, hybrid_exec::register_hybrid_search,
+                match_exec::register_match, vector_exec::register_vector_search,
+            },
+            provider::{SupertableProvider, TABLE_NAME},
         },
-        provider::{SupertableProvider, TABLE_NAME},
     },
 };
+
+/// Classify a SQL execution error: budget exhaustion -> [`QueryError::OverBudget`]
+/// (the catalog surfaces it as `InfinoError::OverBudget`), else an execute error.
+fn exec_query_error(e: DataFusionError) -> QueryError {
+    match e {
+        DataFusionError::ResourcesExhausted(msg) => QueryError::OverBudget(msg),
+        other => QueryError::Execute(other.to_string()),
+    }
+}
 
 impl SupertableReader {
     /// Run a SQL query against this reader's pinned snapshot.
@@ -99,9 +111,8 @@ impl SupertableReader {
                 .sql(&sql)
                 .await
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
-            df.collect()
-                .await
-                .map_err(|e| QueryError::Execute(e.to_string()))
+
+            df.collect().await.map_err(exec_query_error)
         };
 
         // Drive through the shared sync→async bridge: ambient
@@ -153,7 +164,12 @@ impl SupertableReader {
             disk_cache,
             reader.tombstone_cache.clone(),
         );
-        let ctx = SessionContext::new();
+
+        // Gate SQL heap on the connection budget (shared across contexts, so
+        // this reader's SQL counts against the same ceiling as the rest).
+        let ctx = budgeted_session_context(&self.options().connection_memory_budget)
+            .map_err(|e| QueryError::Plan(e.to_string()))?;
+
         // Covered/residual aggregate rewrite: filter-aligned range
         // aggregates answer covered segments from manifest statistics
         // and scan only the boundary segments. Appended after the
@@ -161,6 +177,7 @@ impl SupertableReader {
         ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite));
         ctx.register_table(TABLE_NAME, Arc::new(provider))
             .map_err(|e| QueryError::Plan(e.to_string()))?;
+
         // Search TVFs (vector kNN, BM25 FTS, hybrid RRF) bound to
         // the pinned snapshot. They lower to custom `ExecutionPlan`
         // nodes that call the async kernels inside `execute()`.
@@ -169,7 +186,9 @@ impl SupertableReader {
         // Unranked token / exact match TVFs (siblings of bm25_search).
         register_match(&ctx, Arc::clone(&reader), Arc::clone(&scalar_schema));
         register_hybrid_search(&ctx, Arc::clone(&reader), Arc::clone(&scalar_schema));
+
         *guard = Some((Arc::clone(&manifest), ctx.clone()));
+
         Ok(ctx)
     }
 
@@ -208,10 +227,7 @@ impl SupertableReader {
                 .map_err(|e| QueryError::Plan(e.to_string()))?
                 .select_columns(&[id_column.as_str()])
                 .map_err(|e| QueryError::Plan(e.to_string()))?;
-            let batches = df
-                .collect()
-                .await
-                .map_err(|e| QueryError::Execute(e.to_string()))?;
+            let batches = df.collect().await.map_err(exec_query_error)?;
             extract_id_column(&batches)
         };
 
@@ -291,6 +307,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::{
+        memory::ConnectionMemoryBudget,
         superfile::{
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
@@ -328,6 +345,14 @@ mod tests {
         )
         .expect("valid options")
         .with_writer_pool(pool)
+    }
+
+    // Bounded budget so the reader's SQL path gates DataFusion's heap.
+    // `with_limit(1)` is a 0-byte gate (90% of 1 floors to 0): refuse everything.
+    fn options_with_zero_gate() -> SupertableOptions {
+        let mut opts = options_id_cat_title();
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        opts
     }
 
     /// Build a small categorical batch — start id sequence at
@@ -431,6 +456,53 @@ mod tests {
             "SELECT COUNT(*) FROM supertable WHERE category = 'rust'",
         );
         assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn query_sql_group_by_over_budget_is_refused() {
+        // The reader path (second production ctx site) is gated too: a 0-byte
+        // gate refuses the aggregate and surfaces as QueryError::OverBudget.
+        let st = Supertable::create(options_with_zero_gate()).expect("create");
+        let mut w = st.writer().expect("writer");
+
+        w.append(&build_cat_batch(
+            0,
+            &["rust", "python", "rust"],
+            &["a", "b", "c"],
+        ))
+        .expect("append");
+
+        w.commit().expect("commit");
+
+        let err = st
+            .reader()
+            .query_sql("SELECT category, COUNT(*) FROM supertable GROUP BY category")
+            .expect_err("0-byte gate refuses the aggregate");
+
+        assert!(matches!(err, QueryError::OverBudget(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn query_sql_streaming_scan_is_not_refused_under_a_zero_gate() {
+        // A projection streams (no buffering), so it runs even at a 0-byte gate:
+        // the budget bounds sort/aggregate/join, not scans.
+        let st = Supertable::create(options_with_zero_gate()).expect("create");
+        let mut w = st.writer().expect("writer");
+
+        w.append(&build_cat_batch(0, &["rust", "python"], &["a", "b"]))
+            .expect("append");
+
+        w.commit().expect("commit");
+
+        let rows: usize = st
+            .reader()
+            .query_sql("SELECT title FROM supertable")
+            .expect("a streaming scan is not gated")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+
+        assert_eq!(rows, 2);
     }
 
     #[test]

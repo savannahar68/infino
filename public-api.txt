@@ -66,6 +66,7 @@ pub infino::InfinoError::Backend(alloc::string::String)
 pub infino::InfinoError::Cardinality(alloc::string::String)
 pub infino::InfinoError::Io(alloc::string::String)
 pub infino::InfinoError::NotFound(alloc::string::String)
+pub infino::InfinoError::OverBudget(alloc::string::String)
 pub infino::InfinoError::Query(alloc::string::String)
 pub infino::InfinoError::Schema(alloc::string::String)
 impl core::error::Error for infino::InfinoError

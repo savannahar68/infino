@@ -59,6 +59,14 @@ pub enum InfinoError {
     #[error("query: {0}")]
     Query(String),
 
+    /// A query exceeded the connection's memory budget (see
+    /// [`ConnectOptions::with_connection_memory_budget_bytes`]). For SQL the
+    /// engine spills first and only raises this when it still can't fit.
+    ///
+    /// [`ConnectOptions::with_connection_memory_budget_bytes`]: crate::ConnectOptions::with_connection_memory_budget_bytes
+    #[error("over budget: {0}")]
+    OverBudget(String),
+
     /// Backend / internal failure that doesn't map to a more specific
     /// variant.
     #[error("backend: {0}")]
@@ -80,7 +88,10 @@ impl From<StorageError> for InfinoError {
 
 impl From<QueryError> for InfinoError {
     fn from(e: QueryError) -> Self {
-        InfinoError::Query(e.to_string())
+        match e {
+            QueryError::OverBudget(msg) => InfinoError::OverBudget(msg),
+            other => InfinoError::Query(other.to_string()),
+        }
     }
 }
 
@@ -190,6 +201,11 @@ mod tests {
         assert!(matches!(
             InfinoError::from(QueryError::Plan("p".into())),
             InfinoError::Query(_)
+        ));
+        // A budget refusal keeps its own variant rather than collapsing to Query.
+        assert!(matches!(
+            InfinoError::from(QueryError::OverBudget("b".into())),
+            InfinoError::OverBudget(_)
         ));
         assert!(matches!(
             InfinoError::from(SuperfileReadError::MissingKv("k")),

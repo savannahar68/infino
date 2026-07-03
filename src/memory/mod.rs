@@ -91,6 +91,10 @@ use std::{
     },
 };
 
+mod datafusion_pool;
+
+pub(crate) use datafusion_pool::budgeted_session_context;
+
 /// The fraction of a configured budget we actually enforce: gate at 9/10 and
 /// leave the final 1/10 as headroom for allocations too small to track. Applied
 /// once, in [`ConnectionMemoryBudget::with_limit`].
@@ -179,9 +183,10 @@ impl ConnectionMemoryBudget {
     }
 
     /// Charge `n` bytes to the counter, refusing if that would cross the
-    /// ceiling. On refusal the counter is left unchanged. Backs both
-    /// [`Self::try_reserve`] and [`Reservation::try_grow`].
-    fn try_grow(&self, n: usize) -> Result<(), OverBudget> {
+    /// ceiling. On refusal the counter is left unchanged. Backs
+    /// [`Self::try_reserve`], [`Reservation::try_grow`], and the DataFusion
+    /// pool adapter's `try_grow`.
+    pub(crate) fn try_grow(&self, n: usize) -> Result<(), OverBudget> {
         match self.limit {
             // Unbounded
             None => {
