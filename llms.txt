@@ -38,6 +38,9 @@ https://infino.ai/docs.
 - [Supertable layer](docs/architecture/supertable.md): the table layer over
   many superfiles — manifest snapshots, atomic commits, skip-pruning, and
   concurrency.
+- [On-disk layout](docs/architecture/on-disk-layout.md): the physical view:
+  the files infino writes under a database root, and the pointer chain from
+  the catalog down to each superfile.
 
 ## Reference
 
