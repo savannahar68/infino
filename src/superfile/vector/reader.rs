@@ -26,26 +26,29 @@ use serde::Deserialize;
 use tokio::sync::oneshot;
 
 pub(crate) use crate::superfile::lazy_source::Source;
-use crate::superfile::{
-    ReadError,
-    error::VectorError,
-    format::{
-        checksum::crc32c,
-        vec::{
-            CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES, U64_BYTES,
-            dir_entry, outer_hdr, sub_hdr,
+use crate::{
+    memory::{ConnectionMemoryBudget, Reservation},
+    superfile::{
+        ReadError,
+        error::VectorError,
+        format::{
+            checksum::crc32c,
+            vec::{
+                CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES, U32_BYTES,
+                U64_BYTES, dir_entry, outer_hdr, sub_hdr,
+            },
+            {self},
         },
-        {self},
-    },
-    lazy_source::{LazyByteSource, LazyByteSourceError, PrefetchedSource},
-    vector::{
-        distance::{
-            Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualEpsilonKernel, decode_sq8_residual,
-            distance_bytes, distance_bytes_codec,
+        lazy_source::{LazyByteSource, LazyByteSourceError, PrefetchedSource},
+        vector::{
+            distance::{
+                Metric, SQ8_RESIDUAL_DIVISOR, Sq8Kernel, Sq8ResidualEpsilonKernel,
+                decode_sq8_residual, distance_bytes, distance_bytes_codec,
+            },
+            quant::BitQuantizer,
+            rerank_codec::RerankCodec,
+            rotation::RandomRotation,
         },
-        quant::BitQuantizer,
-        rerank_codec::RerankCodec,
-        rotation::RandomRotation,
     },
 };
 
@@ -168,6 +171,8 @@ struct ProbeCtx<'a> {
     deny: Option<Arc<RoaringBitmap>>,
     /// Rayon pool for CPU work. `None` falls back to the global pool.
     pool: Option<Arc<ThreadPool>>,
+    /// Connection memory budget for the cold cluster-block fetch. See [`reserve_cold_fetch`].
+    budget: Option<Arc<ConnectionMemoryBudget>>,
 }
 
 impl ColumnReader {
@@ -1357,6 +1362,9 @@ impl VectorReader {
             allow: None,
             deny: None,
             pool: None,
+            // `search` is a test/bench-only entry (production vector search goes
+            // through the async paths); its cold fetch is not budget-gated.
+            budget: None,
         };
         let (candidates, survivor_full_ranges) = match build_shortlist(
             col,
@@ -1435,6 +1443,7 @@ impl VectorReader {
         // path; `None` leaves ranking unchanged.
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1490,6 +1499,7 @@ impl VectorReader {
             allow,
             deny,
             pool,
+            budget,
         };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
@@ -1517,6 +1527,7 @@ impl VectorReader {
         // path; `None` leaves ranking unchanged.
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
+        budget: Option<Arc<ConnectionMemoryBudget>>,
     ) -> Result<Vec<(u32, f32)>, VectorError> {
         let (col, validated) = self.resolve_column(column, query, k)?;
         if !validated {
@@ -1548,6 +1559,7 @@ impl VectorReader {
             allow,
             deny,
             pool,
+            budget,
         };
         self.probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
             .await
@@ -1590,6 +1602,12 @@ impl VectorReader {
             .iter()
             .map(|range| self.source.try_get_range_sync(range.clone()))
             .collect();
+
+        // Reserve the cold fetch against the connection budget before it fires;
+        // held for the rest of the probe (covers the cluster blocks). Warm slices
+        // reserve nothing.
+        let mut _cold_guard: Option<Reservation> = None;
+
         let (cluster_blocks, lazy_sq8_meta_bytes, survivor_only_rerank_fetch) =
             if let Some(prefix_blocks) = prefix_blocks_sync {
                 // Warm: prefixes resident. Keep the survivor-only rerank
@@ -1620,6 +1638,10 @@ impl VectorReader {
                     .iter()
                     .map(|&(_, off, cnt)| col.cluster_block_range(off, cnt))
                     .collect();
+
+                _cold_guard =
+                    reserve_cold_fetch(&self.source, &cluster_full_ranges, ctx.budget.as_ref())?;
+
                 let (blocks, meta) = get_cluster_ranges_coalesced_with_extra_async(
                     &self.source,
                     &cluster_full_ranges,
@@ -3059,6 +3081,45 @@ fn apply_coalesce(plan: &CoalescePlan, fetched: &[Bytes]) -> Vec<Bytes> {
         .collect()
 }
 
+// Reserve from the budget, the bytes a cold fetch is about to allocate, and if
+// they do not fit, refuse the search with [`VectorError::OverBudget`] before
+// anything is allocated.
+//
+// Only the ranges that must be fetched are counted. A range already in memory
+// is returned as a zero-copy slice and needs no new memory, so each range is
+// checked and only the missing ("cold") bytes are reserved.
+//
+// The returned guard owns the reservation: hold it while the fetched bytes are
+// in use, and dropping it returns them to the budget. A range evicted between
+// the check here and the fetch is read without a reservation and covered by
+// the budget's headroom.
+fn reserve_cold_fetch(
+    source: &Source,
+    ranges: &[Range<usize>],
+    budget: Option<&Arc<ConnectionMemoryBudget>>,
+) -> Result<Option<Reservation>, VectorError> {
+    let Some(budget) = budget else {
+        // No budget attached: measure-only, nothing to gate.
+        return Ok(None);
+    };
+
+    let cold_bytes: usize = ranges
+        .iter()
+        .filter(|r| source.try_get_range_sync((*r).clone()).is_none())
+        .map(|r| r.len())
+        .sum();
+
+    if cold_bytes == 0 {
+        // Everything already exists in memory.
+        return Ok(None);
+    }
+
+    budget
+        .try_reserve(cold_bytes)
+        .map(Some)
+        .map_err(|e| VectorError::OverBudget(e.to_string()))
+}
+
 fn get_cluster_ranges_coalesced_with_extra(
     source: &Source,
     ranges: &[Range<usize>],
@@ -3395,7 +3456,7 @@ mod tests {
         let (k, rerank, n_cent) = (5usize, 5usize, 4u32);
 
         let full = r
-            .search_async("v", q, k, n_cent as usize, rerank, None, None, None)
+            .search_async("v", q, k, n_cent as usize, rerank, None, None, None, None)
             .await
             .expect("search_async");
         let probed = r
@@ -3405,6 +3466,7 @@ mod tests {
                 k,
                 &(0..n_cent).collect::<Vec<_>>(),
                 rerank,
+                None,
                 None,
                 None,
                 None,
@@ -3423,7 +3485,7 @@ mod tests {
 
         // Probing no clusters returns nothing.
         let none = r
-            .search_clusters_async("v", q, k, &[], rerank, None, None, None)
+            .search_clusters_async("v", q, k, &[], rerank, None, None, None, None)
             .await
             .expect("search_clusters_async empty");
         assert!(none.is_empty(), "probing no clusters returns no hits");
@@ -5989,11 +6051,11 @@ mod tests {
         .expect("open_lazy");
 
         let hits_lazy = r_lazy
-            .search_async("v", &all[17], 5, 4, 20, None, None, None)
+            .search_async("v", &all[17], 5, 4, 20, None, None, None, None)
             .await
             .expect("lazy cold Sq8 search_async");
         let hits_eager = r_eager
-            .search_async("v", &all[17], 5, 4, 20, None, None, None)
+            .search_async("v", &all[17], 5, 4, 20, None, None, None, None)
             .await
             .expect("eager Sq8 search_async");
         // As in the sync lazy-Sq8 test, pin set overlap rather than exact
@@ -6006,6 +6068,135 @@ mod tests {
             eager_ids.intersection(&lazy_ids).count() >= 1,
             "lazy cold Sq8 search_async result set must overlap the eager top-5"
         );
+    }
+
+    #[tokio::test]
+    async fn cold_vector_search_over_budget_is_refused() {
+        // A cold lazy source must fetch the cluster blocks onto the heap. Under
+        // a 0-byte gate the reservation fails, so the search is refused as
+        // OverBudget before the fetch fires, rather than allocating.
+        let (blob, json, all) =
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        counting.disable_sync(); // force the cold path: no resident slices
+
+        let r_lazy = VectorReader::open_lazy(
+            StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy");
+
+        // with_limit(1) -> 0-byte enforced gate: any cold fetch is refused.
+        let budget = ConnectionMemoryBudget::with_limit(1);
+        let err = r_lazy
+            .search_async(
+                "v",
+                &all[0],
+                5,
+                4,
+                20,
+                None,
+                None,
+                None,
+                Some(budget.clone()),
+            )
+            .await
+            .expect_err("cold fetch over a 0-byte gate is refused");
+        assert!(matches!(err, VectorError::OverBudget(_)), "got {err:?}");
+
+        // The gate fired, and a refused reservation commits nothing.
+        assert!(budget.denials() >= 1, "refusal must be counted");
+        assert_eq!(budget.peak(), 0, "refused fetch commits nothing");
+    }
+
+    #[tokio::test]
+    async fn cold_vector_search_under_measured_budget_runs() {
+        // A measured budget tracks but never refuses, so the cold search runs.
+        let (blob, json, all) =
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
+
+        let counting = StdArc::new(CountingLazyByteSource::new(blob));
+        counting.disable_sync();
+
+        let r_lazy = VectorReader::open_lazy(
+            StdArc::clone(&counting) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("open_lazy");
+
+        let budget = ConnectionMemoryBudget::measured();
+        let hits = r_lazy
+            .search_async(
+                "v",
+                &all[0],
+                5,
+                4,
+                20,
+                None,
+                None,
+                None,
+                Some(budget.clone()),
+            )
+            .await
+            .expect("measured budget never refuses");
+        assert!(!hits.is_empty(), "measured cold search returns hits");
+
+        // A non-zero peak proves the cold fetch actually reserved against the
+        // budget (the reservation ran on the query path); a measured budget
+        // never denies. The cold cluster-block fetch for this fixture (32 docs,
+        // 4 clusters, 64-dim, Sq8 rerank) is a deterministic 4608 B; assert a
+        // band around it, wide enough to survive minor codec / layout drift.
+        const MEASURED_PEAK_LOW_BYTES: usize = 3_000;
+        const MEASURED_PEAK_HIGH_BYTES: usize = 8_000;
+
+        assert_eq!(budget.denials(), 0, "measured budget never denies");
+
+        let peak = budget.peak();
+        assert!(
+            (MEASURED_PEAK_LOW_BYTES..=MEASURED_PEAK_HIGH_BYTES).contains(&peak),
+            "measured cold search peak {peak} B outside expected \
+             [{MEASURED_PEAK_LOW_BYTES}, {MEASURED_PEAK_HIGH_BYTES}] band; \
+             a peak near 0 means the budget was never exercised"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_vector_search_is_not_gated() {
+        // An in-memory (resident) reader slices the cluster blocks zero-copy
+        // instead of fetching, so it allocates no per-query heap: even a 0-byte
+        // gate reserves nothing and the search runs.
+        let (blob, json, all) =
+            build_small_superfile(32, 4, 64, RerankCodec::Sq8ResidualEpsilon, Metric::L2Sq);
+        let r_eager = VectorReader::open(blob, &json).expect("eager open");
+        let budget = ConnectionMemoryBudget::with_limit(1);
+
+        let hits = r_eager
+            .search_async(
+                "v",
+                &all[0],
+                5,
+                4,
+                20,
+                None,
+                None,
+                None,
+                Some(budget.clone()),
+            )
+            .await
+            .expect("warm search allocates nothing, so it is not gated");
+        assert!(
+            !hits.is_empty(),
+            "warm search returns hits under a tiny budget"
+        );
+
+        // Resident slices reserve nothing: no denial, and peak stays 0 even
+        // under a 0-byte gate. This is what keeps warm queries off the gate.
+        assert_eq!(budget.denials(), 0, "warm search reserves nothing");
+        assert_eq!(budget.peak(), 0, "warm search commits no bytes");
     }
 
     #[tokio::test]
@@ -6026,11 +6217,31 @@ mod tests {
 
         let clusters: Vec<u32> = (0..4).collect();
         let hits_lazy = r_lazy
-            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None, None, None)
+            .search_clusters_async(
+                "embedding",
+                &all[19],
+                5,
+                &clusters,
+                5,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("lazy cold search_clusters_async");
         let hits_eager = r_eager
-            .search_clusters_async("embedding", &all[19], 5, &clusters, 5, None, None, None)
+            .search_clusters_async(
+                "embedding",
+                &all[19],
+                5,
+                &clusters,
+                5,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("eager search_clusters_async");
         assert_eq!(
@@ -6040,7 +6251,17 @@ mod tests {
         // Out-of-range cluster ids are ignored; an empty selection yields
         // no hits.
         let none = r_lazy
-            .search_clusters_async("embedding", &all[19], 5, &[999u32], 5, None, None, None)
+            .search_clusters_async(
+                "embedding",
+                &all[19],
+                5,
+                &[999u32],
+                5,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("out-of-range clusters");
         assert!(none.is_empty(), "ids >= n_cent are ignored");
@@ -6052,16 +6273,16 @@ mod tests {
         let (blob, json) = build_blob(32, 16, 4, Metric::L2Sq);
         let r = VectorReader::open(blob, &json).expect("open");
         let unknown = r
-            .search_async("nope", &[0.0; 16], 5, 4, 5, None, None, None)
+            .search_async("nope", &[0.0; 16], 5, 4, 5, None, None, None, None)
             .await;
         assert!(matches!(unknown, Err(VectorError::UnknownColumn(_))));
         let dim = r
-            .search_async("embedding", &[0.0; 8], 5, 4, 5, None, None, None)
+            .search_async("embedding", &[0.0; 8], 5, 4, 5, None, None, None, None)
             .await;
         assert!(matches!(dim, Err(VectorError::DimensionMismatch { .. })));
         // k == 0 short-circuits to an empty result.
         let empty = r
-            .search_async("embedding", &[0.0; 16], 0, 4, 5, None, None, None)
+            .search_async("embedding", &[0.0; 16], 0, 4, 5, None, None, None, None)
             .await
             .expect("k=0 empty");
         assert!(empty.is_empty());
@@ -6655,7 +6876,7 @@ mod tests {
         .expect("open_lazy for search_async");
         flaky_a.fail_from_now();
         let err = ra
-            .search_async("embedding", &all[0], 5, 4, 5, None, None, None)
+            .search_async("embedding", &all[0], 5, 4, 5, None, None, None, None)
             .await
             .expect_err("search_async must surface failure");
         assert!(
@@ -6673,7 +6894,17 @@ mod tests {
         .expect("open_lazy for search_clusters_async");
         flaky_c.fail_from_now();
         let err = rc
-            .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None, None, None)
+            .search_clusters_async(
+                "embedding",
+                &all[0],
+                5,
+                &[0, 1, 2, 3],
+                5,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect_err("search_clusters_async must surface failure");
         assert!(
@@ -6898,7 +7129,7 @@ mod tests {
             .expect("open_lazy search_async");
             flaky_a.fail_after_call(fail_at);
             match ra
-                .search_async("embedding", &all[0], 5, 4, 5, None, None, None)
+                .search_async("embedding", &all[0], 5, 4, 5, None, None, None, None)
                 .await
             {
                 Err(VectorError::LazySource(_)) => async_errors += 1,
@@ -6916,7 +7147,17 @@ mod tests {
             .expect("open_lazy search_clusters_async");
             flaky_c.fail_after_call(fail_at);
             match rc
-                .search_clusters_async("embedding", &all[0], 5, &[0, 1, 2, 3], 5, None, None, None)
+                .search_clusters_async(
+                    "embedding",
+                    &all[0],
+                    5,
+                    &[0, 1, 2, 3],
+                    5,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await
             {
                 Err(VectorError::LazySource(_)) => clusters_errors += 1,

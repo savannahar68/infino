@@ -119,6 +119,13 @@ pub mod supertable;
 #[cfg(not(feature = "test-helpers"))]
 pub(crate) mod supertable;
 
+// Same reason: benches/tests that drive the vector kernel name
+// `ConnectionMemoryBudget` in its signatures.
+#[cfg(feature = "test-helpers")]
+pub mod memory;
+#[cfg(not(feature = "test-helpers"))]
+pub(crate) mod memory;
+
 // `roaring` is already an internal dependency. Re-export it under
 // `test-helpers` only, so a bench can build an allow-set for the filtered
 // vector kernel without its own `roaring` dependency. Off the public
@@ -130,7 +137,6 @@ pub use roaring;
 // public items are re-exported at the crate root below.
 mod catalog;
 mod error;
-mod memory;
 mod runtime_bridge;
 mod utils;
 
