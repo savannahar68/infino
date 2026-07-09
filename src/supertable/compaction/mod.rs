@@ -406,7 +406,7 @@ impl Supertable {
             entry: merged_entry,
             bytes_for_store,
             bytes_for_storage,
-            ..
+            bytes_for_cache,
         } = merged_segment;
         let merged_superfile_id = merged_entry.superfile_id;
         let new_entries = vec![merged_entry];
@@ -460,8 +460,19 @@ impl Supertable {
                             "compact: failed to warm reader cache for merged superfile"
                         );
                     }
-                    // Drop the merged-away inputs so the cache doesn't
-                    // grow forever across repeated compactions.
+                    // Same warm-up, disk-cache side: mirrors what a normal
+                    // write does when prepopulate_cache_on_commit is on.
+                    // Shares the writer's own insert_warm_or_warn so the
+                    // two paths can't drift out of sync again.
+                    if let Some((uri, bytes)) = bytes_for_cache
+                        && let Some(cache) = opts.disk_cache.as_ref()
+                    {
+                        cache.insert_warm_or_warn(&uri, bytes).await;
+                    }
+                    // Drop the merged-away inputs so the in-memory cache
+                    // doesn't grow forever across repeated compactions.
+                    // The disk cache is already size-bounded (LRU), so its
+                    // stale entries just age out on their own.
                     for entry in &entries_to_remove {
                         opts.store.remove(&entry.uri);
                     }
@@ -1672,6 +1683,68 @@ mod tests {
                 "merged-away superfile {uri:?} must be evicted from the in-memory cache"
             );
         }
+    }
+
+    /// Same as the in-memory case, but for a disk-cache-attached table:
+    /// the merged superfile should already be resident in the disk
+    /// cache right after compact, with no cold fetch needed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_warms_merged_superfile_into_disk_cache() {
+        use crate::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy};
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("disk-cache"),
+                mmap_cold_threshold_secs: 0,
+                eviction: Box::new(LruPolicy::new()),
+                ..Default::default()
+            },
+        )
+        .expect("disk cache");
+        let st = Supertable::create(
+            default_supertable_options()
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(Arc::clone(&cache)),
+        )
+        .expect("create supertable");
+
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        commit_titles(&st, &["delta first", "delta second"]);
+        commit_titles(&st, &["echo first", "echo second"]);
+        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
+        commit_titles(&st, &["golf first", "golf second"]);
+        commit_titles(&st, &["hotel first", "hotel second"]);
+        commit_titles(&st, &["india first", "india second"]);
+        commit_titles(&st, &["juliet first", "juliet second"]);
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+
+        let cold_fetches_after_compact = cache.stats().n_cold_fetches;
+
+        // A query against the merged file must not trigger a cold
+        // fetch -- it should already be resident from compaction's
+        // own warm-up.
+        let n: usize = st
+            .token_match("title", "alpha", BoolMode::And, None)
+            .expect("token_match")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(n, 2);
+        assert_eq!(
+            cache.stats().n_cold_fetches,
+            cold_fetches_after_compact,
+            "querying the merged superfile should not cold-fetch -- it \
+             should already be warm in the disk cache from compaction"
+        );
     }
 
     /// Vocabulary for realistic term-frequency spread (no `rand` dep).

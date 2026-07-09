@@ -2036,14 +2036,7 @@ fn warm_cache_after_commit(
     let cache = Arc::clone(cache);
     let drive = async move {
         for (uri, bytes) in pending {
-            if let Err(e) = cache.insert_warm(&uri, bytes).await {
-                tracing::warn!(
-                    "supertable: warm cache pre-population failed for {}: {} \
-                     (superfile is durable in storage; first query will cold-fetch)",
-                    uri.0,
-                    e
-                );
-            }
+            cache.insert_warm_or_warn(&uri, bytes).await;
         }
     };
     match Handle::try_current() {
