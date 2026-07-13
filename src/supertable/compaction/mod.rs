@@ -36,7 +36,7 @@ use crate::{
         error::CompactionError,
         query::dispatch::open_reader,
         wal::{
-            SealRecord, WalStore,
+            Etag, SealRecord, WalStore,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
@@ -232,6 +232,8 @@ impl Supertable {
             };
 
         // Build SuperfileStats for every superfile in the snapshot.
+        let now = Utc::now();
+        let stale_seal_timeout = std::time::Duration::from_millis(cfg.stale_seal_timeout_ms);
         let stats: Vec<SuperfileStats> = manifest
             .get_all_superfiles()
             .iter()
@@ -241,7 +243,9 @@ impl Supertable {
                     .cloned()
                     .unwrap_or_else(|| (Arc::new(RoaringBitmap::new()), None));
                 let tombstoned_docs = bitmap.len();
-                let sealed_by_other = seal.is_some();
+                let sealed_by_other = seal.as_ref().is_some_and(|s| {
+                    !tombstones_admin::is_seal_stale(s.sealed_at, now, stale_seal_timeout)
+                });
                 SuperfileStats {
                     superfile_id: entry.superfile_id,
                     partition_key: entry.partition_key.clone(),
@@ -260,7 +264,7 @@ impl Supertable {
         let jobs = select(&stats, cfg);
 
         for job in jobs {
-            self.run_compaction_job(job).await?;
+            self.run_compaction_job(job, stale_seal_timeout).await?;
             self.refresh()
                 .await
                 .map_err(|e| CompactionError::Refresh(e.to_string()))?;
@@ -332,6 +336,7 @@ impl Supertable {
     pub(crate) async fn run_compaction_job(
         &self,
         job: CompactionJob,
+        stale_seal_timeout: std::time::Duration,
     ) -> Result<(), CompactionError> {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
@@ -357,12 +362,15 @@ impl Supertable {
             })
             .collect::<Result<_, _>>()?;
 
-        // Seal every input sidecar.
-        // once sealed, further incoming updates are rejected
-        // and this seal flag helps to prevent overlapping compactions
-        // on same files
+        // Seal every input sidecar so no writer can land a tombstone
+        // on a file that's about to disappear, and so another
+        // compactor doesn't pick up the same inputs. If we die
+        // before unsealing (crash, not a caught error), `seal`
+        // itself lets a later compactor take over once the seal
+        // goes stale.
         let compaction_id = Uuid::new_v4();
         let sealed_at = Utc::now();
+        let mut sealed: Vec<SealedInput> = Vec::with_capacity(inputs.len());
         for entry in &inputs {
             loop {
                 match tombstones_admin::seal(
@@ -370,10 +378,18 @@ impl Supertable {
                     entry.superfile_id,
                     compaction_id,
                     sealed_at,
+                    stale_seal_timeout,
                 )
                 .await
                 {
-                    Ok(_) => break,
+                    Ok((sidecar, etag)) => {
+                        sealed.push(SealedInput {
+                            superfile_id: entry.superfile_id,
+                            bitmap: sidecar.bitmap,
+                            etag,
+                        });
+                        break;
+                    }
                     Err(TombstonesAdminError::CasLost { .. }) => {
                         // A writer landed a tombstone bit between our
                         // GET and our PUT. Re-read and retry — the
@@ -385,22 +401,27 @@ impl Supertable {
                         superfile_id,
                         existing_compaction_id,
                     }) => {
+                        unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::SidecarConflict {
                             superfile_id,
                             existing_compaction_id,
                         });
                     }
                     Err(TombstonesAdminError::WalStore(e)) => {
+                        unseal_all(&wal_store, sealed).await;
                         return Err(CompactionError::Seal(e.to_string()));
                     }
                 }
             }
         }
 
-        let merged_segment = self
-            .merge_superfiles(&inputs)
-            .await
-            .map_err(|e| CompactionError::Build(e.to_string()))?;
+        let merged_segment = match self.merge_superfiles(&inputs).await {
+            Ok(seg) => seg,
+            Err(e) => {
+                unseal_all(&wal_store, sealed).await;
+                return Err(CompactionError::Build(e.to_string()));
+            }
+        };
 
         let PreparedSuperfile {
             entry: merged_entry,
@@ -479,18 +500,51 @@ impl Supertable {
                     return Ok(());
                 }
                 Err(CommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                    self.refresh()
-                        .await
-                        .map_err(|e| CompactionError::Refresh(e.to_string()))?;
+                    if let Err(e) = self.refresh().await {
+                        unseal_all(&wal_store, sealed).await;
+                        return Err(CompactionError::Refresh(e.to_string()));
+                    }
                     time::sleep(backoff_delay(attempt)).await;
                 }
-                Err(e) => return Err(CompactionError::Commit(e.to_string())),
+                Err(e) => {
+                    unseal_all(&wal_store, sealed).await;
+                    return Err(CompactionError::Commit(e.to_string()));
+                }
             }
         }
 
+        unseal_all(&wal_store, sealed).await;
         Err(CompactionError::Commit(
             "commit retries exhausted".to_string(),
         ))
+    }
+}
+
+/// One superfile this attempt sealed: enough to unseal it later with
+/// no extra GET (`unseal` uses the etag + bitmap straight from `seal`).
+struct SealedInput {
+    superfile_id: Uuid,
+    bitmap: RoaringBitmap,
+    etag: Etag,
+}
+
+/// Best-effort: clear every seal this attempt placed, in parallel --
+/// each one is an independent sidecar, so there's no ordering or
+/// shared-state reason to do them one at a time.
+async fn unseal_all(wal_store: &WalStore, sealed: Vec<SealedInput>) {
+    let results = join_all(sealed.into_iter().map(|s| {
+        let wal_store = wal_store.clone();
+        async move {
+            let result =
+                tombstones_admin::unseal(&wal_store, s.superfile_id, s.bitmap, &s.etag).await;
+            (s.superfile_id, result)
+        }
+    }))
+    .await;
+    for (superfile_id, result) in results {
+        if let Err(e) = result {
+            warn!(superfile_id = %superfile_id, error = %e, "compact: failed to unseal after aborting");
+        }
     }
 }
 
@@ -505,12 +559,16 @@ mod tests {
     use super::*;
     use crate::{
         BoolMode, Supertable,
+        config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
         supertable::{
             error::CompactionError,
             storage::{LocalFsStorageProvider, StorageProvider},
         },
         test_helpers::{build_title_batch, default_supertable_options},
     };
+
+    const DEFAULT_STALE_SEAL_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
 
     fn mib(n: u64) -> u64 {
         n * MIB
@@ -682,12 +740,147 @@ mod tests {
             estimated_output_bytes: 0,
         };
         let err = st
-            .run_compaction_job(job)
+            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
             .await
             .expect_err("must error on unknown input");
         assert!(
             matches!(err, CompactionError::SuperfileNotFound(id) if id == bogus),
             "{err:?}"
+        );
+    }
+
+    /// If one input is already sealed by a different, still-live
+    /// compaction, we abort -- but must unseal whatever we already
+    /// sealed ourselves this attempt, not leave it stranded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_unseals_its_own_inputs_when_a_later_one_conflicts() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+
+        let entries = st.reader().manifest().superfiles.clone();
+        assert_eq!(entries.len(), 2);
+        let (entry_a, entry_b) = (&entries[0], &entries[1]);
+
+        // entry_b is already held by a different, still-live compaction.
+        let storage = st
+            .inner()
+            .manifest
+            .load_full()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed table");
+        let wal_store = WalStore::new(storage);
+        let foreign_cid = Uuid::new_v4();
+        tombstones_admin::seal(
+            &wal_store,
+            entry_b.superfile_id,
+            foreign_cid,
+            Utc::now(),
+            DEFAULT_STALE_SEAL_TIMEOUT,
+        )
+        .await
+        .expect("seal entry_b as foreign");
+
+        let job = CompactionJob {
+            partition_key: entry_a.partition_key.clone(),
+            inputs: vec![entry_a.superfile_id, entry_b.superfile_id],
+            estimated_output_bytes: 1,
+        };
+        let err = st
+            .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
+            .await
+            .expect_err("must conflict on entry_b");
+        assert!(matches!(err, CompactionError::SidecarConflict { .. }));
+
+        // entry_a got sealed by us first, then unsealed on the abort.
+        let (sidecar_a, _) = wal_store
+            .get_tombstones(entry_a.superfile_id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert!(sidecar_a.seal.is_none());
+
+        // entry_b's foreign seal is untouched -- it's not ours to clear.
+        let (sidecar_b, _) = wal_store
+            .get_tombstones(entry_b.superfile_id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            sidecar_b.seal.expect("still sealed").compaction_id,
+            foreign_cid
+        );
+    }
+
+    /// A stale seal (left behind by a crashed compactor, no error
+    /// ever caught to clean it up) must not exclude its superfile
+    /// from selection forever. Once it's older than
+    /// `DEFAULT_STALE_SEAL_TIMEOUT`, a fresh `compact_async` call
+    /// must pick it up and actually merge it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_recovers_a_superfile_stuck_under_a_stale_seal() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+
+        commit_titles(&st, &["alpha first", "alpha second"]);
+        commit_titles(&st, &["bravo first", "bravo second"]);
+        commit_titles(&st, &["charlie first", "charlie second"]);
+        commit_titles(&st, &["delta first", "delta second"]);
+        commit_titles(&st, &["echo first", "echo second"]);
+        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
+        commit_titles(&st, &["golf first", "golf second"]);
+        commit_titles(&st, &["hotel first", "hotel second"]);
+        commit_titles(&st, &["india first", "india second"]);
+        commit_titles(&st, &["juliet first", "juliet second"]);
+
+        let entries = st.reader().manifest().superfiles.clone();
+        let crashed_entry = &entries[0];
+
+        // Simulate a compactor that sealed this file and then died
+        // long enough ago that its seal is now stale.
+        let storage = st
+            .inner()
+            .manifest
+            .load_full()
+            .options
+            .storage
+            .clone()
+            .expect("storage-backed table");
+        let wal_store = WalStore::new(storage);
+        let old_time = Utc::now()
+            - chrono::Duration::from_std(DEFAULT_STALE_SEAL_TIMEOUT).unwrap_or_default()
+            - chrono::Duration::seconds(1);
+        tombstones_admin::seal(
+            &wal_store,
+            crashed_entry.superfile_id,
+            Uuid::new_v4(),
+            old_time,
+            DEFAULT_STALE_SEAL_TIMEOUT,
+        )
+        .await
+        .expect("simulate a stale seal");
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact must succeed and recover the stale seal");
+
+        // The stuck superfile must not still be sitting in the
+        // manifest under its original id -- it has to have actually
+        // been picked up and merged, not just left alone while its
+        // 9 unsealed siblings merged around it.
+        let still_stuck = st
+            .reader()
+            .manifest()
+            .superfiles
+            .iter()
+            .any(|s| s.superfile_id == crashed_entry.superfile_id);
+        assert!(
+            !still_stuck,
+            "the stale-sealed superfile must have been merged, not left behind"
         );
     }
 
@@ -2051,9 +2244,15 @@ mod tests {
         let abandoned_compaction_id = Uuid::new_v4();
         let sealed_at = Utc::now();
         for id in &stranded_ids {
-            tombstones_admin::seal(&wal_store, *id, abandoned_compaction_id, sealed_at)
-                .await
-                .expect("seal");
+            tombstones_admin::seal(
+                &wal_store,
+                *id,
+                abandoned_compaction_id,
+                sealed_at,
+                DEFAULT_STALE_SEAL_TIMEOUT,
+            )
+            .await
+            .expect("seal");
         }
 
         // New data arrives and a generous compaction config runs.
