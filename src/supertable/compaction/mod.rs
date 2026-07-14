@@ -99,6 +99,7 @@ pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<Co
     let target_bytes = cfg.target_superfile_size_mb.saturating_mul(MIB);
     let min_output_bytes =
         (target_bytes as u128 * cfg.min_fill_percent.clamp(1, 100) as u128 / 100) as u64;
+    let max_memory_bytes = cfg.max_memory_mb.saturating_mul(MIB);
 
     let mut by_partition: BTreeMap<&[u8], Vec<&SuperfileStats>> = BTreeMap::new();
     for s in superfiles {
@@ -107,7 +108,14 @@ pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<Co
 
     let mut jobs = Vec::new();
     for (key, segs) in by_partition {
-        pack_partition(key, segs, target_bytes, min_output_bytes, &mut jobs);
+        pack_partition(
+            key,
+            segs,
+            target_bytes,
+            min_output_bytes,
+            max_memory_bytes,
+            &mut jobs,
+        );
     }
     jobs
 }
@@ -117,6 +125,7 @@ fn pack_partition(
     segs: Vec<&SuperfileStats>,
     target_bytes: u64,
     min_output_bytes: u64,
+    max_memory_bytes: u64,
     jobs: &mut Vec<CompactionJob>,
 ) {
     // Exclude superfiles already at target size — they are done and
@@ -137,7 +146,7 @@ fn pack_partition(
 
     let mut pending = PendingJob::default();
     for s in candidates {
-        if !pending.fits(s, target_bytes) {
+        if !pending.fits(s, target_bytes, max_memory_bytes) {
             pending.emit(key, min_output_bytes, jobs);
         }
         pending.push(s);
@@ -149,14 +158,17 @@ fn pack_partition(
 struct PendingJob {
     inputs: Vec<Uuid>,
     live_bytes: u64,
+    raw_bytes: u64,
 }
 
 impl PendingJob {
-    fn fits(&self, s: &SuperfileStats, target_bytes: u64) -> bool {
+    fn fits(&self, s: &SuperfileStats, target_bytes: u64, max_memory_bytes: u64) -> bool {
         self.live_bytes + s.live_bytes() <= target_bytes
+            && self.raw_bytes + s.size_bytes <= max_memory_bytes
     }
 
     fn push(&mut self, s: &SuperfileStats) {
+        self.raw_bytes += s.size_bytes;
         self.inputs.push(s.superfile_id);
         self.live_bytes += s.live_bytes();
     }
@@ -283,6 +295,21 @@ impl Supertable {
         let disk_cache = manifest.options.disk_cache.clone();
         let storage = manifest.options.storage.clone();
         let tombstone_cache = self.inner().tombstone_cache.clone();
+
+        // This reserves budget for the whole input size since merge still
+        // loads it all at once. Real fix is streaming the merge and pooling
+        // buffers instead of a flat reservation; picking that up later.
+        let input_bytes: u64 = superfiles
+            .iter()
+            .map(|e| e.subsection_offsets.as_ref().map_or(0, |o| o.total_size))
+            .sum();
+        // double the input bytes to account for the merge buffer and any overhead
+        let estimated_bytes = input_bytes.saturating_mul(2) as usize;
+        let _memory_reservation = manifest
+            .options
+            .connection_memory_budget
+            .try_reserve(estimated_bytes)
+            .map_err(|e| BuildError::MemoryBudgetExceeded(e.to_string()))?;
 
         let mut superfile_readers_fut = Vec::with_capacity(superfiles.len());
         for entry in superfiles {
@@ -602,6 +629,7 @@ mod tests {
     use crate::{
         BoolMode, Supertable,
         config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
+        memory::ConnectionMemoryBudget,
         supertable::{
             error::CompactionError,
             storage::{LocalFsStorageProvider, StorageProvider},
@@ -738,18 +766,33 @@ mod tests {
     #[test]
     fn pending_job_fits_until_target_exceeded() {
         let target = mib(100);
+        let max_memory = mib(1000);
         let mut p = PendingJob::default();
         let a = seg(1, 60, 1000, 0); // 60 MiB live
-        assert!(p.fits(&a, target));
+        assert!(p.fits(&a, target, max_memory));
         p.push(&a);
         assert_eq!(p.live_bytes, mib(60));
         assert_eq!(p.inputs.len(), 1);
         // A second 60 MiB superfile would overflow the 100 MiB target.
         let b = seg(2, 60, 1000, 0);
-        assert!(!p.fits(&b, target));
+        assert!(!p.fits(&b, target, max_memory));
         // A 40 MiB superfile fits exactly to the boundary.
         let c = seg(3, 40, 1000, 0);
-        assert!(p.fits(&c, target));
+        assert!(p.fits(&c, target, max_memory));
+    }
+
+    #[test]
+    fn pending_job_fits_respects_max_memory_even_under_target() {
+        // live_bytes fits comfortably under target, but raw size_bytes
+        // (pre-tombstone) would blow past a tight memory ceiling.
+        let target = mib(1000);
+        let max_memory = mib(100);
+        let mut p = PendingJob::default();
+        let a = seg(1, 60, 1000, 0); // 60 MiB raw, 60 MiB live
+        assert!(p.fits(&a, target, max_memory));
+        p.push(&a);
+        let b = seg(2, 60, 1000, 0); // would push raw to 120 MiB > 100 MiB cap
+        assert!(!p.fits(&b, target, max_memory));
     }
 
     #[test]
@@ -1225,6 +1268,47 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("token_match for '{term}'"));
             assert_eq!(hits.len(), 2, "term '{term}' should match exactly 2 docs");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_superfiles_respects_connection_memory_budget() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+
+        // Write the data with a normal budget first — ingest draws from the
+        // same connection budget, so a tight limit here would starve the
+        // setup appends too.
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create supertable");
+        {
+            let mut w = st.writer().expect("writer");
+            let batch = build_title_batch(&["first doc", "second doc"]);
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        {
+            let mut w = st.writer().expect("writer");
+            let batch = build_title_batch(&["third doc", "fourth doc"]);
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        // Reopen the same committed data under a starved budget to exercise
+        // the merge-time reservation.
+        let mut opts = default_supertable_options().with_storage(Arc::clone(&storage));
+        opts.connection_memory_budget = ConnectionMemoryBudget::with_limit(1);
+        let st = Supertable::create(opts).expect("reopen supertable");
+
+        let reader = st.reader();
+        let superfiles: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
+
+        match st.merge_superfiles(&superfiles).await {
+            Err(BuildError::MemoryBudgetExceeded(_)) => {}
+            Err(other) => panic!("expected MemoryBudgetExceeded, got {other:?}"),
+            Ok(_) => panic!("merge must be refused over budget"),
         }
     }
 

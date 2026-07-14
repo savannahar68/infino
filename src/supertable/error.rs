@@ -115,6 +115,9 @@ pub enum BuildError {
     #[error("superfile store: {0}")]
     Store(String),
 
+    #[error("merge needs more memory than the connection budget allows: {0}")]
+    MemoryBudgetExceeded(String),
+
     #[error("rayon thread pool creation failed: {0}")]
     ThreadPoolCreation(String),
 
