@@ -154,6 +154,7 @@ use crate::{
     supertable::{
         CommitError as SupertableCommitError, ManifestLoadError,
         build::{fanout_shards, fanout_shards_metered},
+        drain_profile,
         error::{BuildError, ManifestError},
         handle::{
             GLOBAL_VECTOR_KMEANS_ITERS, GLOBAL_VECTOR_KMEANS_SEED, Supertable, SupertableInner,
@@ -4772,10 +4773,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
     }
     let _slot = Slot(&hidden_inner.compaction_outstanding);
+    let mut prof = drain_profile::DrainProfile::start(
+        user_inner.options.storage.as_ref().map(|s| s.usage_meter()),
+        hidden_inner.options.disk_cache.clone(),
+    );
+    prof.step("setup.grid");
 
     // The global cell grid is owned by the USER manifest (bootstrapped at the
     // first commit). The hidden cell index is the derived copy this drain writes.
     let Some(gvi) = user_inner.manifest.load_full().get_global_vector_index() else {
+        prof.finish("no_global_vector_index");
         return Ok(());
     };
     let column = gvi.column;
@@ -4804,6 +4811,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // them (append — one file per touched cell), then frees its working set.
     // Batch size is `vector.drain_batch_superfiles`: `0` = skip, `-1` =
     // unbounded single merge.
+    prof.note_drain("grid_n_cent", clusters.n_cent);
+    prof.note_drain("dim", clusters.dim);
+    prof.note_drain("hidden_bootstrapped", hidden_bootstrapped);
+    prof.step("setup.load_user_manifest_parts");
     let user_manifest = user_inner.manifest.load_full();
     // A cold-open user manifest is parts-backed and may have an empty flat
     // view. Drain must hydrate the authoritative user parts; reading only
@@ -4818,7 +4829,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         |entry| entry.superfile_id,
     )
     .collect();
+    prof.note("user_superfiles_listed", sources.len());
     if sources.is_empty() {
+        prof.finish("no_user_superfiles");
         return Ok(());
     }
     let batch_cfg = drain_batch_superfiles(&user_inner.options);
@@ -4843,13 +4856,16 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // A remote checkpoint pins the exact source epoch. New user commits can
     // land while it is in progress; they are intentionally left for the next
     // drain instead of invalidating or silently replacing this epoch.
+    prof.step("setup.options_hash");
     let drained = hidden_inner.manifest.load_full().get_drained_ranges();
     let user_strategy = user_manifest.get_partition_strategy();
     let current_options_hash =
         options_hash::compute_options_hash(user_inner.options.as_ref(), &user_strategy).to_hex();
-    let (batches, mut remote_state) = if let Some(remote_state) =
-        load_drain_remote_checkpoint(&hidden_inner).await?
-    {
+    prof.step("setup.load_remote_checkpoint");
+    let loaded_remote = load_drain_remote_checkpoint(&hidden_inner).await?;
+    prof.note("resuming", loaded_remote.is_some());
+    prof.step("setup.plan_batches_and_create_remote_checkpoint");
+    let (batches, mut remote_state) = if let Some(remote_state) = loaded_remote {
         if remote_state.checkpoint.shard_count != shard_count {
             return Err(BuildError::Store(format!(
                 "drain checkpoint shard count {} != configured writer width {shard_count}",
@@ -4937,8 +4953,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 "[supertable drain] nothing to drain: all {} user superfile(s) already drained",
                 sources.len()
             );
+            prof.finish("nothing_to_drain");
             return Ok(());
         }
+        prof.note("undrained_superfiles", selected.len());
         selected.sort_unstable_by(|left, right| {
             left.birth_version
                 .cmp(&right.birth_version)
@@ -4969,6 +4987,30 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let remote_state = create_drain_remote_checkpoint(&hidden_inner, checkpoint).await?;
         (batches, remote_state)
     };
+    prof.note_drain("batches", batches.len());
+    prof.note_drain("batch_budget_superfiles", batch_cfg);
+    prof.note_drain(
+        "source_superfiles",
+        batches.iter().map(|(_, b)| b.len()).sum::<usize>(),
+    );
+    prof.note_drain(
+        "source_superfile_mib",
+        batches
+            .iter()
+            .flat_map(|(_, b)| b.iter())
+            .filter_map(|e| e.subsection_offsets.as_ref().map(|o| o.total_size))
+            .sum::<u64>() as f64
+            / (1024.0 * 1024.0),
+    );
+    prof.note_drain("shard_count", shard_count);
+    prof.note_drain(
+        "consolidate",
+        match consolidate {
+            DrainConsolidate::Kmeans => "kmeans",
+            DrainConsolidate::Splice => "splice",
+        },
+    );
+    prof.step("setup.local_checkpoint_and_resume");
 
     let store = user_inner.options.store.clone();
     let storage_opt = user_inner.options.storage.clone();
@@ -5002,6 +5044,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let drain_scratch = drain_scratch_dir(&remote_state.checkpoint.epoch_id);
     fs::create_dir_all(&drain_scratch)
         .map_err(|error| BuildError::Store(format!("drain scratch create: {error}")))?;
+    prof.set_scratch(&drain_scratch);
+    prof.note_drain("assign_skip", assign_skip);
     let mut local_checkpoint =
         load_drain_local_checkpoint(&drain_scratch, &remote_state.checkpoint.epoch_id)?
             .unwrap_or_else(|| DrainLocalCheckpoint::new(remote_state.checkpoint.epoch_id.clone()));
@@ -5132,6 +5176,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // built lazily on the first batch that has rows to assign, so a drain with
     // no assign work never builds it. `running_clusters` is only read inside
     // the loop (reassigned after it), so one build serves every batch.
+    prof.step("setup.fine_router");
     let drain_graph_assign = config::global().vector.drain_graph_assign;
     let drain_timers = config::global().diagnostics.drain_build_timers;
     let mut coarse_router: Option<(opann::Fp32Scorer, opann::Hnsw, Vec<u32>)> = None;
@@ -5199,6 +5244,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             None
         }
     };
+    prof.note_drain("fine_router_engaged", fine_router.is_some());
     if fine_router.is_some() {
         debug!(
             target: "infino::gfc",
@@ -5224,16 +5270,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             continue;
         }
         let batch_t0 = std::time::Instant::now();
-        // Timeline diagnostic only: snapshot GETs for this batch without
-        // clearing the shared usage meter (a no-op when the env gate is off).
-        let gets_before = if crate::storage::io_counters::timeline_enabled() {
-            let snap = storage_opt.as_ref().map(|s| s.usage_meter().snapshot());
-            crate::storage::io_counters::timeline_reset();
-            snap
-        } else {
-            None
-        };
+        prof.step("batch.open");
+        prof.note("batch", batch_idx + 1);
+        prof.note("superfiles", batch_sources.len());
         let read_concurrency = drain_read_concurrency();
+        prof.note("read_concurrency", read_concurrency);
         // Open this batch's user superfiles FULLY RESIDENT: the splice/materialize
         // read via `try_get_range_sync` on rayon workers, which needs the whole
         // superfile in memory — a lazy reader yields VectorReadError. Reuse a
@@ -5270,25 +5311,41 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     // synchronously, which a promoted hybrid reader (sparse
                     // vector region) cannot serve.
                     let reader = match store.reader(&entry.uri) {
-                        Ok(r) if r.is_fully_resident() => r,
-                        _ => {
+                        Ok(r) if r.is_fully_resident() => {
+                            drain_profile::count("open.reader_cache_hit_resident");
+                            r
+                        }
+                        cached => {
+                            if cached.is_ok() {
+                                drain_profile::count("open.reader_cache_hit_not_resident");
+                            }
                             let storage = storage_opt.as_ref().ok_or_else(|| {
                                 BuildError::Store(
                                     "drain requires storage to load user superfiles".into(),
                                 )
                             })?;
+                            let get_t0 = time::Instant::now();
                             let (bytes, _) = storage
                                 .get(&entry.storage_path())
                                 .await
                                 .map_err(|e| BuildError::Store(e.to_string()))?;
-                            Arc::new(SuperfileReader::open(bytes).map_err(BuildError::from)?)
+                            drain_profile::record(
+                                "open.get_full_object",
+                                get_t0.elapsed(),
+                                bytes.len() as u64,
+                            );
+                            Arc::new(drain_profile::timed("open.parse_superfile", || {
+                                SuperfileReader::open(bytes).map_err(BuildError::from)
+                            })?)
                         }
                     };
                     // Write-path materialization: no per-query collector.
-                    let stable_ids =
-                        stable_ids_by_local_for_routing(&manifest, &entry, &reader, &None)
-                            .await
-                            .map_err(|e| BuildError::Store(e.to_string()))?;
+                    let stable_ids = drain_profile::timed_async(
+                        "open.routing_ids",
+                        stable_ids_by_local_for_routing(&manifest, &entry, &reader, &None),
+                    )
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
                     Ok::<_, BuildError>((reader, stable_ids))
                 }
             }))
@@ -5303,46 +5360,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .into_iter()
             .collect::<Result<Vec<_>, BuildError>>()?;
 
-        // The batch's superfile reads land here (opens are fully resident). The
-        // timeline distinguishes a serial dependent chain (concurrency ~1x) from
-        // overlapped reads (concurrency ~ buffered fan-out) — the lever for the
-        // materialize phase. Gated on INFINO_IO_TIMELINE.
-        if crate::storage::io_counters::timeline_enabled() {
-            let spans = crate::storage::io_counters::timeline_take();
-            let range_gets = match (storage_opt.as_ref(), gets_before.as_ref()) {
-                (Some(s), Some(before)) => s.usage_meter().snapshot().since(before).get_count,
-                _ => 0,
-            };
-            let min_start = spans.iter().map(|s| s.start_us).min().unwrap_or(0);
-            let max_end = spans.iter().map(|s| s.end_us).max().unwrap_or(0);
-            let wall_us = max_end.saturating_sub(min_start);
-            let sum_us: u64 = spans
-                .iter()
-                .map(|s| s.end_us.saturating_sub(s.start_us))
-                .sum();
-            let bytes: u64 = spans.iter().map(|s| s.len).sum();
-            let concurrency = if wall_us > 0 {
-                sum_us as f64 / wall_us as f64
-            } else {
-                0.0
-            };
-            info!(
-                "[supertable drain] batch {}/{} materialize I/O: {} object reads, {:.1} MiB, wall {:.1}ms, Σdur {:.1}ms, implied concurrency {:.1}x ({} range-gets)",
-                batch_idx + 1,
-                n_batches,
-                spans.len(),
-                bytes as f64 / (1u64 << 20) as f64,
-                wall_us as f64 / 1e3,
-                sum_us as f64 / 1e3,
-                concurrency,
-                range_gets,
-            );
-        }
-
         // One consolidate mode, one shared checkpoint + pack/upload tail.
         // `drain_consolidate` selects how cells are produced — never a fallback.
         let batch_log = match consolidate {
             DrainConsolidate::Splice => {
+                prof.step("batch.splice_route");
                 let column_name_ref = column_name.as_str();
                 let stable_ids_per_input: Vec<Vec<i128>> =
                     readers.iter().map(|(_, ids)| ids.clone()).collect();
@@ -5379,6 +5401,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 // Accumulate in cell-id order: `routed` is a HashMap, and its
                 // iteration order would otherwise vary run to run, changing the
                 // spliced cells' byte layout on identical input.
+                prof.step("batch.splice_accumulate");
+                prof.note("cells", n_cells);
                 let mut routed: Vec<_> = routed.into_iter().collect();
                 routed.sort_unstable_by_key(|(cell_id, _)| *cell_id);
                 for (cell_id, (subsection, stable_ids)) in routed {
@@ -5402,6 +5426,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 )
             }
             DrainConsolidate::Kmeans => {
+                prof.step("batch.materialize");
                 let column_for_mat = column_name.clone();
                 let tombstone_cache = user_inner.tombstone_cache.clone();
                 let now = time::Instant::now();
@@ -5412,16 +5437,22 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             let tombstone_cache = tombstone_cache.clone();
                             let entry = Arc::clone(entry);
                             async move {
-                                let bitmap = tombstone_cache
-                                    .as_ref()
-                                    .map(|t| t.bitmap_for(entry.superfile_id, now))
-                                    .transpose()
+                                let bitmap =
+                                    drain_profile::timed("materialize.tombstone_bitmap", || {
+                                        tombstone_cache
+                                            .as_ref()
+                                            .map(|t| t.bitmap_for(entry.superfile_id, now))
+                                            .transpose()
+                                    })
                                     .map_err(|e| BuildError::Store(e.to_string()))?;
-                                materialized_user_rows_for_drain(
-                                    reader,
-                                    &column_for_mat,
-                                    stable_ids,
-                                    bitmap.as_deref(),
+                                drain_profile::timed_async(
+                                    "materialize.rows",
+                                    materialized_user_rows_for_drain(
+                                        reader,
+                                        &column_for_mat,
+                                        stable_ids,
+                                        bitmap.as_deref(),
+                                    ),
                                 )
                                 .await
                             }
@@ -5438,6 +5469,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     .into_iter()
                     .collect::<Result<Vec<_>, BuildError>>()?;
                 let t_mat = batch_t0.elapsed().as_secs_f64() * 1e3;
+                prof.step("batch.flatten_dedup");
 
                 let assign_spill_span = detail_span!(
                     "drain_batch.assign_spill",
@@ -5468,9 +5500,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     .filter(|row| seen_stable_ids.insert(row.stable_id))
                     .collect();
                 record("distinct_rows", distinct_rows.len());
+                prof.note("rows", n_batch_rows);
+                prof.note("distinct_rows", distinct_rows.len());
                 if assign_skip
                     && drain_replica_extra_budget(distinct_rows.len(), replica_target) == 0
                 {
+                    prof.step("batch.spill_assign_skip");
                     // Globally-aligned superfiles with no drain-side budget:
                     // trust ingest placement on the distinct set (replicas
                     // included as already stamped at commit).
@@ -5512,6 +5547,18 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         graph = use_graph_assign,
                     )
                     .entered();
+                    prof.step("batch.assign");
+                    prof.note("rows", distinct_rows.len());
+                    prof.note(
+                        "path",
+                        if fine_router.is_some() {
+                            "fine_router"
+                        } else if use_graph_assign {
+                            "coarse_graph"
+                        } else {
+                            "exact_shortlist"
+                        },
+                    );
                     let assign_t0 = std::time::Instant::now();
                     let assignments: Vec<opann::BoundaryAssignment> = if distinct_rows.is_empty() {
                         // No rows to assign: never build the router (skip-empty).
@@ -5589,7 +5636,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize, metric);
                         hidden_inner.options.writer_pool.install(|| {
                             let router = coarse_router.get_or_insert_with(|| {
-                                opann::build_coarse_router(clusters_ref, metric)
+                                drain_profile::timed("assign.coarse_router_build", || {
+                                    opann::build_coarse_router(clusters_ref, metric)
+                                })
                             });
                             // Shared reborrows so the parallel closure captures
                             // `&` (Sync), not the `&mut` from
@@ -5662,6 +5711,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             "[optdrain] batch cell-assign phase"
                         );
                     }
+                    prof.step("batch.spill_replicas");
+                    prof.note("replica_budget", replica_extra_budget);
                     let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
                         .iter()
                         .enumerate()
@@ -5687,6 +5738,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             distinct_rows[row_idx],
                         )?;
                     }
+                    prof.step("batch.spill_primaries");
                     for (row, assignment) in distinct_rows.iter().zip(&assignments) {
                         spill_unfinished_shard_row(
                             &mut cell_spills,
@@ -5703,6 +5755,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         }
                     }
                 }
+                prof.step("batch.spill_checkpoint");
+                prof.note("spill_files", cell_spills.len());
                 let mut checkpointed_spills = HashMap::with_capacity(cell_spills.len());
                 for (&cell, writer) in &mut cell_spills {
                     let state = writer.checkpoint().map_err(BuildError::from)?;
@@ -5738,6 +5792,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             }
         };
 
+        prof.step("batch.local_checkpoint");
         local_checkpoint.batches_done = batch_idx + 1;
         local_checkpoint.added_per_cell = added_per_cell.clone();
         {
@@ -5774,6 +5829,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // kmeans worker streams its row-spilled cells one at a time, checkpoints
     // their completed IVF files, then assembles one MultiCellIvf.
     {
+        prof.step("build.spill_finish_and_group");
         let build_t0 = time::Instant::now();
         // Drain build sub-phase wall timers (ms), surfaced as [optdrain] under
         // the drain-build-timers gate. `assemble` (the pack/build/encode/splice/
@@ -5853,6 +5909,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // shards, and the maintenance pool is contractually
         // optimize-only. The grid MOVES into the task and comes back
         // with the frozen state — no clone of the centroid bytes.
+        prof.note_drain("cells", n_cells_total);
+        prof.note_drain("drained_rows", total_rows);
+        prof.step("build.width_law_freeze");
         let freeze_t0 = time::Instant::now();
         if let Some(mut cal) = width_law.take() {
             let rot_seed = vector_config.rot_seed;
@@ -5874,6 +5933,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
         freeze_ms += freeze_t0.elapsed().as_secs_f64() * 1e3;
         let width_law_ref = width_law.as_ref();
+        prof.step("build.cell_build");
+        prof.note("shards", shard_sources.len());
+        prof.note(
+            "workers",
+            hidden_inner.options.writer_pool.current_num_threads(),
+        );
         let cell_build_span = detail_span!(
             "drain_cell_build",
             shards = shard_sources.len(),
@@ -5917,13 +5982,24 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 let score_t0 = time::Instant::now();
                                 cal.score_cell(*cell_id, spill)?;
                                 record("score_ms", score_t0.elapsed().as_millis() as u64);
+                                drain_profile::record(
+                                    "cell.width_law_score",
+                                    score_t0.elapsed(),
+                                    0,
+                                );
                             }
+                            let cell_t0 = time::Instant::now();
                             let cell = build_spilled_packed_cell_from_rows(
                                 scratch,
                                 *cell_id,
                                 spill,
                                 &vector_config,
                             )?;
+                            drain_profile::record(
+                                "cell.build_ivf",
+                                cell_t0.elapsed(),
+                                cell.subsection_len,
+                            );
                             // The checkpoint below reopens these files on
                             // resume, so they must reach disk first. Its
                             // directory fsync makes the renames durable.
@@ -5934,11 +6010,18 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                 )?;
                             }
                             record("fsync_ms", fsync_t0.elapsed().as_millis() as u64);
+                            drain_profile::record("cell.fsync", fsync_t0.elapsed(), 0);
                             let checkpoint_t0 = time::Instant::now();
                             {
                                 let mut state = checkpoint.lock().map_err(|_| {
                                     BuildError::Store("drain checkpoint lock poisoned".into())
                                 })?;
+                                drain_profile::record(
+                                    "cell.checkpoint_lock_wait",
+                                    checkpoint_t0.elapsed(),
+                                    0,
+                                );
+                                let save_t0 = time::Instant::now();
                                 state.spills.remove(cell_id);
                                 state.built_cells.insert(
                                     *cell_id,
@@ -5949,9 +6032,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                     },
                                 );
                                 save_drain_local_checkpoint(&drain_scratch, &state)?;
+                                drain_profile::record("cell.checkpoint_save", save_t0.elapsed(), 0);
                             }
                             record("checkpoint_ms", checkpoint_t0.elapsed().as_millis() as u64);
-                            spill.remove_files();
+                            drain_profile::timed("cell.remove_spill", || spill.remove_files());
                             cell
                         }
                     };
@@ -5959,11 +6043,19 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 }
                 let prepared: PreparedSuperfile = {
                     let _span = detail_span!("drain_shard.assemble").entered();
-                    build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)?
+                    drain_profile::timed("shard.assemble", || {
+                        build_prepared_from_spilled_cells(
+                            &hidden_inner,
+                            scratch,
+                            *shard_id,
+                            &packed,
+                        )
+                    })?
                 };
                 // Depth-law observation: fine clusters exist only now that
                 // the shard is packed; record each surviving candidate's
                 // fine-centroid rank from the shard's own bytes.
+                let depth_t0 = time::Instant::now();
                 if let Some(cal) = width_law_ref {
                     match prepared.open_reader() {
                         Some(reader) => {
@@ -5990,6 +6082,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                              bytes not retained (cache-attached, no prepopulation)"
                         ),
                     }
+                    drain_profile::record("shard.depth_law_reopen", depth_t0.elapsed(), 0);
                 }
                 Ok::<_, BuildError>(prepared)
             },
@@ -6006,6 +6099,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 prepared_shards.len() + completed_shards.len()
             )));
         }
+        prof.step("build.collect_prepared");
         let publish = collect_prepared_superfiles(&hidden_inner, prepared_shards)?;
         if !publish.to_remove.is_empty() {
             return Err(BuildError::Store(
@@ -6029,7 +6123,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .map(|(storage_key, bytes)| {
                 let storage = Arc::clone(&storage);
                 async move {
-                    put_new_superfile_bytes(
+                    let put_t0 = time::Instant::now();
+                    let n_bytes = bytes.len() as u64;
+                    let out = put_new_superfile_bytes(
                         &storage,
                         multipart_threshold,
                         storage_key.clone(),
@@ -6037,9 +6133,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     )
                     .await
                     .map(|()| storage_key)
-                    .map_err(|error| BuildError::Store(error.to_string()))
+                    .map_err(|error| BuildError::Store(error.to_string()));
+                    drain_profile::record("upload.put_superfile", put_t0.elapsed(), n_bytes);
+                    out
                 }
             });
+        prof.step("build.upload");
+        prof.note("multipart_threshold_bytes", multipart_threshold);
+        prof.note("write_concurrency", commit_write_concurrency().get());
         let upload_t0 = time::Instant::now();
         let upload_span = detail_span!("drain.upload", superfiles = entry_by_key.len());
         let mut uploads =
@@ -6075,7 +6176,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 .checkpoint
                 .completed_shards
                 .sort_unstable_by_key(|shard| shard.shard_id);
-            save_drain_remote_checkpoint(&hidden_inner, &mut remote_state).await?;
+            drain_profile::timed_async(
+                "upload.remote_checkpoint_save",
+                save_drain_remote_checkpoint(&hidden_inner, &mut remote_state),
+            )
+            .await?;
             #[cfg(test)]
             maybe_fail_drain_for_test(
                 &remote_state.checkpoint.epoch_id,
@@ -6085,15 +6190,18 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             completed_shards.insert(shard_id);
             new_entries.push(entry);
 
-            for (cell, _) in cell_counts {
-                local_checkpoint.spills.remove(&cell);
-                if let Some(state) = local_checkpoint.built_cells.remove(&cell)
-                    && let Ok(packed) = restore_spilled_packed_cell(&drain_scratch, cell, &state)
-                {
-                    remove_spilled_packed_cell(&packed);
+            drain_profile::timed("upload.local_cleanup_and_checkpoint", || {
+                for (cell, _) in cell_counts {
+                    local_checkpoint.spills.remove(&cell);
+                    if let Some(state) = local_checkpoint.built_cells.remove(&cell)
+                        && let Ok(packed) =
+                            restore_spilled_packed_cell(&drain_scratch, cell, &state)
+                    {
+                        remove_spilled_packed_cell(&packed);
+                    }
                 }
-            }
-            save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
+                save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)
+            })?;
         }
         trace::end(upload_span);
         upload_ms += upload_t0.elapsed().as_secs_f64() * 1e3;
@@ -6110,6 +6218,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // from the files when it matters (e.g. split eligibility reads
         // tombstone-aware per-cell counts). This running sum is therefore an
         // approximate population signal, not an exact cumulative doc count.
+        prof.step("build.apply_cell_updates");
         let mut cell_updates: HashMap<u32, u32> = HashMap::new();
         for (cell, added) in &added_per_cell {
             let base = running_clusters
@@ -6150,6 +6259,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // real cross-generation spread until a full rebuild recalibrates.
         // The alternative (rescoring every packed cell per incremental
         // drain) would make drain cost track table size, not delta size.
+        prof.step("build.calibrate_finish");
         let finish_span = detail_span!("drain.calibrate_finish").entered();
         if let Some(cal) = width_law.take()
             && let Some(laws) = cal.finish(&running_clusters, None)
@@ -6216,6 +6326,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // (uploaded above), so the prospective's readers can score them; the
         // graph blob is PUT here and orphaned harmlessly if the commit loses
         // the CAS. The settle then reuses it (population key matches) → no-op.
+        prof.step("build.prospective_manifest");
         let old_hidden = hidden_inner.manifest.load_full();
         let (prospective, _parts) = list_metadata
             .apply(&old_hidden)
@@ -6232,9 +6343,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // Which resident index this drain builds, if any. One manifest slot
         // carries whichever it is, and the envelope states its kind, so adding
         // a kind here does not widen the manifest.
+        prof.step("build.resident_index");
         let index_mode = crate::config::global().vector.search_mode;
         let building_graph = index_mode == crate::config::VectorSearchMode::HnswIvf;
         let building_flat = index_mode == crate::config::VectorSearchMode::FlatIvf;
+        prof.note("search_mode", format!("{index_mode:?}"));
         // Warm the DISK CACHE with the just-drained cell bytes — already
         // resident in `pending_cache_inserts` — BEFORE the build, so the graph's
         // full re-read of these same cells is served from the local cache
@@ -6270,6 +6383,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // Commit A (membership). Visibility-gating state MUST land here,
         // atomically with `drained_ranges`: cells, watermark, and the resident
         // graph in one CAS. Do not defer any of it to the settle below.
+        prof.step("build.commit_membership");
         let new_manifest = persist_commit_async(
             &hidden_inner,
             Arc::clone(&storage),
@@ -6298,6 +6412,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // In-memory store tier (cache-less deployments only): warmed after the
         // commit succeeds, so a lost CAS never pins bytes in the non-evicting
         // store.
+        prof.step("build.store_inserts_and_cache_warm");
+        prof.note("cache_inserts", pending_cache_inserts.len());
         apply_pending_store_inserts(&hidden_inner, pending_store_inserts);
         // Disk-cache warm for the non-graph path (`ivf`/`gfc`): after the
         // commit, matching the baseline ordering (lower peak file memory than
@@ -6309,6 +6425,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             let _span = detail_span!("drain.cache_warm").entered();
             warm_cache_after_commit(&hidden_inner, cache, pending_cache_inserts);
         }
+        prof.step("build.scratch_cleanup");
         if let Err(error) = fs::remove_dir_all(&drain_scratch)
             && error.kind() != io::ErrorKind::NotFound
         {
@@ -6332,6 +6449,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         if crate::superfile::vector::builder::build_phase_timers::enabled() {
             let (train_ms, assign_ms, calib_ms) =
                 crate::superfile::vector::builder::build_phase_timers::snapshot_ms();
+            prof.note_drain("cell_build_train_cpu_ms", train_ms);
+            prof.note_drain("cell_build_assign_cpu_ms", assign_ms);
+            prof.note_drain("cell_build_calibrate_cpu_ms", calib_ms);
             info!(
                 "[supertable drain] cell build phases (summed CPU, {n_cells_total} cells): train {train_ms:.1}ms + assign {assign_ms:.1}ms + calibrate {calib_ms:.1}ms",
             );
@@ -6370,6 +6490,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // warning. `false`: the drain-tail settle publishes membership only and does
     // NOT run the O(N) fanout calibration — compaction re-settles and calibrates
     // (gated by policy), so calibrating here is redundant within an optimize.
+    prof.step("settle");
     let __ds = std::time::Instant::now();
     refresh_slow_vector_state(&hidden_inner, false).await?;
     if crate::config::global().diagnostics.optimize_phase_timers {
@@ -6378,7 +6499,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             __ds.elapsed().as_secs_f64()
         );
     }
+    prof.step("schedule_storage_reclaim");
     schedule_background_storage_reclaim(Arc::clone(&hidden_inner));
+    prof.finish("done");
     Ok(())
 }
 
@@ -7295,6 +7418,7 @@ fn build_prepared_from_spilled_cells(
     let mut id_min = i128::MAX;
     let mut id_max = i128::MIN;
     let mut ids_seen = 0usize;
+    let ids_t0 = time::Instant::now();
     for cell in &ordered {
         let mut reader = BufReader::new(
             File::open(&cell.stable_ids_path)
@@ -7334,9 +7458,11 @@ fn build_prepared_from_spilled_cells(
             "shard {shard_id}: stable id count {ids_seen} != expected {n_docs}"
         )));
     }
+    drain_profile::record("assemble.ids_and_stats", ids_t0.elapsed(), 0);
 
     let mut output = NamedTempFile::new_in(scratch)
         .map_err(|error| BuildError::Store(format!("packed shard temp create: {error}")))?;
+    let write_t0 = time::Instant::now();
     builder.finish_multi_cell_sources_to(&ordered, BufWriter::new(output.as_file_mut()))?;
     output
         .as_file_mut()
@@ -7344,6 +7470,12 @@ fn build_prepared_from_spilled_cells(
         .map_err(|error| BuildError::Store(format!("packed shard temp flush: {error}")))?;
     let bytes = mmap_readonly_bytes(output.path())
         .map_err(|error| BuildError::Store(format!("packed shard mmap: {error}")))?;
+    drain_profile::record(
+        "assemble.write_superfile",
+        write_t0.elapsed(),
+        bytes.len() as u64,
+    );
+    let prepare_t0 = time::Instant::now();
 
     let (id_min, id_max) = if n_docs == 0 {
         (0, 0)
@@ -7359,6 +7491,7 @@ fn build_prepared_from_spilled_cells(
     };
     let prepared = prepare_superfile(inner, shard)?.ok_or(BuildError::NoDocsToBuild)?;
     let entry = finish_superfile_entry(prepared.entry, Some(shard_id))?;
+    drain_profile::record("assemble.prepare_superfile", prepare_t0.elapsed(), 0);
     Ok(PreparedSuperfile {
         entry,
         bytes_for_store: prepared.bytes_for_store,
@@ -11330,27 +11463,33 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
         }
         // Carried-forward entries are stripped (routing-shaped hydration);
         // their fp32 composes from the previous generation's section.
-        let previous_section =
-            previous_centroid_section(&inner.options, storage.as_ref(), &old).await;
-        let published = match pending_drain.as_ref() {
-            Some(pending) => {
-                slow_vector_state::write_state_with_pending_drain(
-                    storage.as_ref(),
-                    entries,
-                    pending,
-                    previous_section.as_deref(),
-                )
-                .await
+        let previous_section = drain_profile::timed_async(
+            "slowstate.previous_centroid_section",
+            previous_centroid_section(&inner.options, storage.as_ref(), &old),
+        )
+        .await;
+        let published = drain_profile::timed_async("slowstate.write_state", async {
+            match pending_drain.as_ref() {
+                Some(pending) => {
+                    slow_vector_state::write_state_with_pending_drain(
+                        storage.as_ref(),
+                        entries,
+                        pending,
+                        previous_section.as_deref(),
+                    )
+                    .await
+                }
+                None => {
+                    slow_vector_state::write_state(
+                        storage.as_ref(),
+                        entries,
+                        previous_section.as_deref(),
+                    )
+                    .await
+                }
             }
-            None => {
-                slow_vector_state::write_state(
-                    storage.as_ref(),
-                    entries,
-                    previous_section.as_deref(),
-                )
-                .await
-            }
-        }
+        })
+        .await
         .map_err(|e| BuildError::Store(e.to_string()))?;
         // The `hnsw` graph is built and stamped ONLY in the membership commit
         // (Commit A), atomically with `drained_ranges`. This settle carries the
@@ -11385,12 +11524,15 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
                     // publishes it.
                     None if !calibrate_fanout => None,
                     None => {
-                        build_and_publish_centroid_router_section(
-                            inner,
-                            storage.as_ref(),
-                            &old,
-                            entries,
-                            &published.centroids,
+                        drain_profile::timed_async(
+                            "slowstate.centroid_router_section",
+                            build_and_publish_centroid_router_section(
+                                inner,
+                                storage.as_ref(),
+                                &old,
+                                entries,
+                                &published.centroids,
+                            ),
                         )
                         .await
                     }
@@ -11420,13 +11562,18 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             centroid_graph,
         );
         let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
-            .await
-            .inspect_err(|e| inner.note_commit_error(e))
-            .map_err(BuildError::from)?;
-        match new_manifest
-            .write(storage.as_ref(), prev_etag.as_deref(), &[])
-            .await
+        let prev_etag = drain_profile::timed_async(
+            "slowstate.manifest_etag",
+            get_current_manifest_etag(&storage, Arc::clone(&old)),
+        )
+        .await
+        .inspect_err(|e| inner.note_commit_error(e))
+        .map_err(BuildError::from)?;
+        match drain_profile::timed_async(
+            "slowstate.manifest_write",
+            new_manifest.write(storage.as_ref(), prev_etag.as_deref(), &[]),
+        )
+        .await
         {
             Ok(()) => {
                 inner.note_superseded(&old, &new_manifest, &[]);
@@ -11434,6 +11581,7 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
                 return Ok(());
             }
             Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                drain_profile::count("slowstate.cas_retry");
                 next_id_floor = next_id_floor.max(
                     refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
                         .await

@@ -544,6 +544,11 @@ diagnostics:
   # Accumulate per-phase timers during the vector drain build.
   drain_build_timers: false
 
+  # Profile every drain step (wall, CPU, RSS, object-store and disk-cache
+  # traffic; request latency when io_timeline is also on) and write one JSON
+  # report per drain under <scratch_root>/infino-drain-profiles/.
+  drain_profile: false
+
   # Emit top-level optimize() phase timers ([optphase]: drain / split / merge /
   # recalibrate / settle / compact_total / router_cache) and the merge
   # splice-vs-rebuild split ([optmerge]). A measuring stick for compaction

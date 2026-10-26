@@ -25,6 +25,7 @@
 
 pub(crate) mod build;
 pub(crate) mod companion;
+pub(crate) mod drain_profile;
 pub mod error;
 pub(crate) mod gc;
 #[cfg(feature = "graph-index")]

@@ -1122,6 +1122,10 @@ impl Default for VectorSettings {
 pub struct DiagnosticsSettings {
     /// Accumulate per-phase timers during the vector drain build.
     pub drain_build_timers: bool,
+    /// Profile every drain step — wall, CPU, RSS, object-store and disk-cache
+    /// traffic, request latency with `io_timeline` — and write one JSON
+    /// report per drain under `<scratch_root>/infino-drain-profiles/`.
+    pub drain_profile: bool,
     /// Emit top-level optimize() phase timers ([optphase]: drain / split / merge
     /// / recalibrate / settle / compact_total / router_cache) plus the merge
     /// splice-vs-rebuild split ([optmerge]). Off by default; a measuring stick

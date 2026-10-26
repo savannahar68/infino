@@ -287,12 +287,14 @@ fn translate(uri: &str, e: ObjError) -> StorageError {
 impl StorageProvider for GcsStorageProvider {
     async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
         let path = self.path(uri)?;
+        let tl = io_counters::timeline_start();
         let meta = self
             .store
             .head(&path)
             .await
             .map_err(|e| translate(uri, e))?;
         self.meter.record_head();
+        io_counters::timeline_record("head", uri, 0, 0, tl);
         Ok(ObjectMeta {
             size: meta.size,
             etag: version_token(&meta),
@@ -384,6 +386,7 @@ impl StorageProvider for GcsStorageProvider {
         // create-if-absent). Re-issue only transient failures. Return the
         // new *generation* (r.version) — the CAS token callers chain forward
         // — not the HTTP etag (r.e_tag).
+        let tl = io_counters::timeline_start();
         let out = retry::with_reissue(|| {
             let bytes = bytes.clone();
             async {
@@ -401,6 +404,7 @@ impl StorageProvider for GcsStorageProvider {
         .await;
         if out.is_ok() {
             self.meter.record_put(n);
+            io_counters::timeline_record("put", uri, 0, n, tl);
         }
         out
     }
@@ -410,6 +414,7 @@ impl StorageProvider for GcsStorageProvider {
         let n = bytes.len() as u64;
         // Overwrite is idempotent, so a transient failure re-issues like the
         // create-only path; there is no precondition to lose.
+        let tl = io_counters::timeline_start();
         let out = retry::with_reissue(|| {
             let bytes = bytes.clone();
             async {
@@ -427,6 +432,7 @@ impl StorageProvider for GcsStorageProvider {
         .await;
         if out.is_ok() {
             self.meter.record_put(n);
+            io_counters::timeline_record("put", uri, 0, n, tl);
         }
         out
     }
@@ -456,6 +462,7 @@ impl StorageProvider for GcsStorageProvider {
         };
         // Return the new generation (r.version), same as put_atomic — this is
         // the token the WAL/manifest OCC loops chain into the next CAS.
+        let tl = io_counters::timeline_start();
         let out = self
             .store
             .put_opts(&path, PutPayload::from_bytes(bytes), opts)
@@ -464,6 +471,7 @@ impl StorageProvider for GcsStorageProvider {
             .map_err(|e| translate(uri, e));
         if out.is_ok() {
             self.meter.record_put(n);
+            io_counters::timeline_record("put_if_match", uri, 0, n, tl);
         }
         out
     }
